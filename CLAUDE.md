@@ -58,10 +58,21 @@ Getting this order backwards puts VS characters adjacent to the wrong
 digits in the model's actual token stream and silently weakens the defense
 without it being obvious from the visible output.
 
-`NFKC != strip_both`. NFKC strips VS characters but preserves bidi controls
-(model still reads the wrong digit order). `strip_all`/strip_both removes
-both. These are measured as separate attack conditions in Table 6 — do not
-collapse them.
+`NFKC != strip_both`. These are measured as separate attack conditions in
+Table 6 — do not collapse them. **Correction (2026-08-14):** this section
+previously claimed "NFKC strips VS characters but preserves bidi controls."
+That's wrong as a statement about standard Unicode normalization, and was
+disproved directly (`src/test_normalization_forms.py`, no model/GPU
+needed): NFC/NFD/NFKC/NFKD all leave a real composed-GHOST encoding
+byte-identical to raw (50/50 VS chars and 2/2 bidi controls survive every
+form). Reason: `apply_nfkc` (`unicode_utils.py`) is literally
+`unicodedata.normalize('NFKC', text)`, and Variation Selectors
+(U+FE00-FE0F, U+E0100-E01EF) have no compatibility decomposition to
+nothing in the UCD — real NFKC does not touch them. `strip_all`/strip_both
+is the only one of these that actually removes VS chars; it does so via
+an explicit codepoint filter (`strip_vs`), not normalization. See
+"Normalization-attack verification" under GHOST-Agent below for what this
+means for frontier-model extraction, not just the byte-level check.
 
 ## Encoding conditions (`src/encode.py`)
 
@@ -140,8 +151,9 @@ push further per-instance.
 
 A separate, self-improving variant: instead of the fixed encode-then-check
 pipeline above (one logprob threshold, calibrated once, applied uniformly),
-an LLM agent (`claude-sonnet-4-6`, fixed per the task doc's CRITICAL RULE 5)
-iterates generate → query adversary → reflect → improve, using six tool
+an LLM agent (`claude-sonnet-4-6` by default -- CRITICAL RULE 5 originally
+fixed this, now a config-driven ablation axis, see "Configurable agent
+backbone" below) iterates generate → query adversary → reflect → improve, using six tool
 primitives (`render`, `get_stored`, `hamming`, `encode_bidi`, `encode_vs`,
 `combine`) in `ghost_tools.py`. The point is not "extend GHOST to a new
 content type" — it's searching for sufficiently complex, per-instance
@@ -431,6 +443,234 @@ the committed pipeline's reconstruction-mode stage) is still a stub;
 `check_reconstruction`'s threshold=0.7 is a provisional default, not a
 calibrated one.
 
+### Configurable agent backbone (`src/agent_backbone.py`) — deviation from CRITICAL RULE 5
+
+GHOST_AGENT_TASKS.md's CRITICAL RULE 5 originally fixed the agent role
+(the model that proposes encodings, as opposed to the adversary
+ensemble/verify tiers that attack them) to `claude-sonnet-4-6`. That
+hardcode is gone: the agent role is now backbone-configurable via a new
+`config.yaml` section, `agent_backbones` (`default: claude_sonnet`,
+`options:` keyed by backbone name), resolved through
+`agent_backbone.resolve_backbone(name, config)`. Motivation: real API
+cost of running claude-sonnet-4-6 as the agent across hundreds of
+fields is expensive, and self-improving-agent literature generally uses
+a cheap/local model for the acting role, reserving frontier models for
+judging — this makes backbone choice itself an ablation axis (Claude
+Sonnet/Haiku/Opus vs. a local DeepSeek-R1 distill) rather than a fixed
+constant, same in kind as the earlier single-adversary → ensemble-panel
+deviation above.
+
+Two backbone implementations behind one interface
+(`reset`/`run_turn`/`generate_text`/`close`):
+  - `AnthropicBackbone` — thin wrapper around `run_agent_turn` (moved
+    from `ghost_agent.py`, unchanged logic, `model_id` now a parameter
+    instead of a hardcoded constant). Native `tool_use`/`tool_result`
+    blocks, same as before.
+  - `LocalReActBackbone` — local HF causal LMs (e.g.
+    `deepseek-ai/DeepSeek-R1-Distill-Qwen-32B`, added to
+    `local_models`/`agent_backbones.options` alongside the existing
+    `deepseek_r1_14b`) have no Anthropic-style structured tool use, so
+    tool calls go through a text protocol instead: the model emits
+    `<tool_call>{"name": ..., "input": {...}}</tool_call>`, parsed by
+    regex + `json.loads` (malformed JSON is skipped, not fatal — a
+    local model emitting broken JSON is an expected failure mode, not
+    a crash). Same `TOOL_FUNCTIONS`/`execute_tool_call` dispatch as the
+    Anthropic path — only the calling *protocol* differs, never the
+    tools themselves. `strip_think_tags` applied before parsing (a
+    stray `<tool_call>`-shaped string inside a hidden `<think>` block
+    must not be parsed as real).
+
+Loaded ONCE and reused across an entire ablation run, not reloaded per
+field: `LocalReActBackbone.reset()` clears conversation state but keeps
+weights resident, mirroring the load-time-dominates-cost lesson already
+learned from the search-tier ensemble (see "Timing" under Real
+single-field runs above) — reloading a 14B/32B model every field would
+reintroduce that same problem for the agent role too. `convergence.py`
+now takes `--agent_backbone <name>`, constructs the backbone once
+before its document loop, passes the same instance to every
+`run_ghost_agent` call via a new `backbone=` param, and closes it in a
+`finally` after the loop.
+
+`run_ghost_agent`'s original `client=` param (an injectable
+Anthropic-SDK-shaped client, used by tests) is preserved unchanged for
+back-compat: when neither `backbone=` nor `agent_backbone_name=` is
+given, it builds a default `AnthropicBackbone(model_id="claude-sonnet-4-6",
+client=client)` — every pre-existing call site (`smoke_test_task5.py`,
+`verify_gemini_run.py`, `verify_reconstruction_run*.py`,
+`self_improving_length_test.py`) is unaffected and needed no changes.
+`distil_principle` (principle distillation, Component B) now takes a
+`backbone` instead of a `client` + hardcoded model, so a local-model
+ablation run distils principles using the local model too, not a
+hardcoded Anthropic call underneath.
+
+**Known confound, not yet resolved by tooling — must be handled by the
+experiment design instead:** `deepseek_r1_14b` is listed in BOTH
+`agent_ensemble.members` (search-tier ensemble) and
+`agent_backbones.options` (agent role). Using it as the agent backbone
+while it's also an ensemble voter is potentially circular — same risk
+already flagged for why `qwen25_7b` (the encoding-time proxy) is
+excluded from `agent_ensemble.members`. If `deepseek_r1_14b` is ever
+used as the agent backbone for a real ablation run, exclude it from
+`agent_ensemble.members` for that run, or treat any "defended" verdict
+from it with the same skepticism as a proxy grading its own homework.
+`deepseek_r1_32b` has no such conflict (not an ensemble member) and is
+the more defensible local-model ablation arm for this reason alone,
+separate from its stronger reasoning capacity.
+
+**Not yet run:** no real backbone-ablation results exist yet — only a
+mocked smoke test (`smoke_test_agent_backbone.py`, no GPU/API calls)
+verifying `LocalReActBackbone`'s tool-call round-trip and
+`resolve_backbone`'s config dispatch. Real convergence numbers per
+backbone (success rate, iterations, cost) still need an actual run.
+
+### Real `deepseek_r1_32b` backbone debugging session (first real, non-mocked exercise)
+
+First attempt to run `deepseek_r1_32b` as the agent backbone on a real
+field (`jurisdiction_code = "QLD-17"`, Track A pilot doc `regfiling_0000`,
+`src/verify_deepseek_r1_32b_backbone.py`, scratch/uncommitted). Surfaced
+three real, unrelated failures in sequence, each fixed before the next
+was even visible — not a single bug, a chain of them:
+
+1. **GPU VRAM OOM at iteration 2** — the resident 32B backbone (~64GB
+   bf16) and a search-tier ensemble member's own GPU residency briefly
+   overlapped mid-run (`torch.OutOfMemoryError`, ~78GB in use of 79.25GB
+   capacity). Fixed by adding `release_gpu()`/`reacquire_gpu()` to the
+   `Backbone` interface — `LocalReActBackbone` moves its weights to CPU
+   immediately before `ensemble_query_fn` and back immediately after;
+   no-op for `AnthropicBackbone`. `ghost_agent.py`'s loop calls these
+   around every `ensemble_query_fn` call unconditionally.
+2. **Host-RAM SIGKILL (exit 137) before any GPU work started** — this
+   SLURM interactive allocation only has `--mem=60G`, and staging a 32B
+   model's checkpoint shards into host RAM during `from_pretrained`
+   already exceeds that on its own, independent of fix #1 above (which
+   made it WORSE, since `release_gpu()` also needs ~64GB of host RAM to
+   hold the offloaded weights). Fixed by adding 8-bit quantization
+   (`bitsandbytes`, `agent_backbone.py`'s `_load_backbone_model`,
+   config-gated via `agent_backbones.options.deepseek_r1_32b.quantization:
+   "8bit"`) — ~32-34GB VRAM instead of ~64-66GB, fixing both the VRAM
+   contention AND the host-RAM staging spike at once. `release_gpu()`/
+   `reacquire_gpu()` are deliberately no-ops when quantized: the
+   footprint no longer needs relief, AND `bitsandbytes`' `Linear8bitLt`
+   layers hold GPU-specific quantization state that isn't guaranteed
+   safe to round-trip through an arbitrary `.to("cpu")`/`.to("cuda")`
+   move. Introduces quantization noise as an uncharacterised variable in
+   the encoding-search results — not yet measured against an unquantized
+   run.
+3. **Tool-call parser gap, not a model capability gap** — once loading
+   was fixed, the backbone kept failing to converge:
+   `_parse_tool_calls` only recognised the instructed
+   `<tool_call>...</tool_call>` tag, but real `deepseek_r1_32b` output
+   used markdown ` ```json ` fences instead (confirmed via
+   `diagnose_local_backbone.py`, a lighter backbone-only probe built
+   specifically to capture FULL untruncated model text — `ghost_agent.py`'s
+   own prints truncate to 300/500 chars, which was hiding this). Fixed:
+   `_parse_tool_calls` now accepts both forms, matched in the order they
+   appear; a JSON block without a `"name"` key is still correctly
+   ignored (so an unrelated ` ```json ` example in the model's prose
+   isn't misparsed as a real call). Also found and fixed: `run_turn`
+   ignored `self.max_new_tokens` (the backbone's own configured budget)
+   in favor of whatever the caller's `response_max_tokens` happened to
+   be — both `run_turn` and `generate_text` now take
+   `max(caller_value, self.max_new_tokens)` as a floor.
+4. **Still unresolved, separate from all three fixes above:** even with
+   the parser fixed, the backbone's `<final_encoding>` output doesn't
+   reflect the transformation it narrates — both real attempts on this
+   field ended with the literal, untransformed `"QLD-17"`. One response
+   also hallucinated having already called `combine("QLD-17", "full_rtl",
+   "ghost")` in a prior iteration when no tool call had actually
+   happened. This reads as a genuine capability gap for this model at
+   this ReAct-over-text-protocol task (narrating a plausible plan
+   without executing/copying it), not something a parser or prompt
+   tweak alone is confirmed to fix — deliberately NOT addressed yet
+   (scope explicitly deferred: "fix the parser only" was the chosen
+   scope for this session). The verification run that would give a real
+   converged/failed final answer for this field was stopped mid-way
+   (backbone-loaded, iteration 1 in progress) to prioritize the
+   sentence-level obfuscation work below — no real end-to-end result
+   exists yet for `deepseek_r1_32b` as backbone on any field.
+
+### Sentence-level obfuscation (Phase 1 + 2 built; VS/GHOST-Agent extension deferred)
+
+Every existing condition (`bidi_only`/`vs_only`/`ghost`/`bidi_permute`/
+`ghost_permute`, `src/encode.py`'s `_apply_field_transform`) and
+GHOST-Agent both obfuscate ONLY the isolated field value, never the
+surrounding sentence (label, expected format, prose) — leaving an
+adversary contextual scaffolding it can use to reconstruct a garbled
+value. Chosen over whole-document scope: nearly all the real contextual
+leakage sits in the immediate sentence, and whole-document-scale bidi
+permutation is a much larger, previously-untested surface for the
+project's non-negotiable "must render identically" guarantee to quietly
+break on. `bidi_permute` (the separable-permutation mechanism) was
+extended first, not the combined bidi+VS `ghost_permute` — one new
+scaling problem at a time.
+
+**Phase 1 (de-risking, `src/bidi_permute.py`) found and fixed a real bug
+before any pipeline wiring, exactly why the gate existed:**
+`find_target_permutation` only ever optimised Hamming distance and
+NEVER verified round-trip correctness — true by coincidence for the
+digit-only fields (2-12 chars) this module was built for, but a real
+~10-30% round-trip failure rate on realistic sentence-like text (20-400
+chars, letters/spaces/punctuation), confirmed via a new
+`_self_test_sentence_scale()` (`--selftest-sentence` CLI flag). Root
+cause: neutral/weak bidi-type characters (spaces, punctuation) can land
+in a permutation position where UAX#9's real neutral-resolution rules
+(W1-W7/N1-N2) diverge from the naive "every character is an
+independently reorderable opaque unit" construction this module makes —
+NOT simply "any real prose eventually fails" (two direct control tests —
+no boundary neutrals; forced boundary neutrals — both passed 0/40,
+ruling out the simplest hypothesis). Fixed by making round-trip
+correctness a hard filter INSIDE the search loop (`find_target_permutation`
+now rejects any candidate that doesn't actually render back via the real
+`bidi.get_display` oracle, not just an after-the-fact assumption) —
+re-verified 100% round-trip across all tested lengths, embedding depth a
+clean max of 25 against UAX#9's real 125-level cap (also unverified at
+this scale before now). Cost: search is now real, non-trivial API-oracle
+work per trial instead of a cheap integer comparison (field-length
+self-test 330/330 went from near-instant to ~8s; sentence-scale 500-trial
+budget took ~52s for 50 instances) — `config.yaml`'s
+`bidi_permute_search_trials: 500` was calibrated when search was free;
+worth re-timing against a realistic per-document budget before a full
+run. The two existing production callers (`encode_bidi_permute`,
+`encode_ghost_permute`) were hardened with a loud `RuntimeError` instead
+of a confusing crash for the (rare, previously-impossible) case where
+the filtered search exhausts its trial budget with no valid candidate.
+
+**Phase 2 (`src/sentence_utils.py`, `src/encode.py`) wires this into a
+new condition, `bidi_permute_sentence`** (added to `config.yaml`'s
+`encoding_conditions`, never collapsed with `bidi_permute` — same
+"measured as separate conditions" convention as `NFKC != strip_both`).
+`find_field_sentence(text, field_value, char_span=None)` supports BOTH
+dataset shapes in one function: `data/raw/documents.json`
+(`src/dataset.py`'s `text = " ".join(sentences)`, one phrase-template
+sentence per field — no boundary detection needed, `text.find` suffices)
+and Track A's narrative prose (real sentence-boundary detection via
+`char_span`, since a field value can repeat elsewhere in a longer
+document). Boundary regex splits on whitespace immediately following
+`[.!?]` — deliberately NOT triggered by the punctuation alone, since
+decimal amounts (`"1234.56"`) and ICD-style codes (`"A12.3"`,
+`dataset.py`'s `_gen_icd_code`) never have adjacent whitespace at their
+internal period, sidestepping digit-adjacency lookarounds entirely.
+`_apply_sentence_transform` dedupes fields sharing one sentence — a REAL
+case, not hypothetical: Track A's `regfiling_0000` has `jurisdiction_code`
+and `registration_date` genuinely in the same sentence, confirmed
+directly and used as a smoke-test fixture. `smoke_test_sentence_utils.py`
+verifies all of this against real data (both dataset shapes, the
+decimal/ICD edge cases, the real shared-sentence case) with NO mocking of
+the bidi oracle, including the most important check: **full-document
+round-trip** (`bidi_visible(encoded_doc["text"]) == original_doc["text"]`)
+— not just the isolated sentence in a vacuum, since that's the scope the
+condition actually ships at.
+
+**Explicitly deferred, not silently dropped:** `ghost_permute_sentence`
+(VS injection at sentence scope — a second new scaling problem,
+injection density over much longer text); GHOST-Agent tool/loop changes
+to operate at sentence scope (the six tools are already content-agnostic,
+so this is mostly a caller-side change in `convergence.py` plus a
+check-extraction variant that pulls the field back out of a
+sentence-scale response); real timing/cost validation of
+`bidi_permute_search_trials` at sentence scale for a full dataset run;
+whole-document scope (already rejected in favour of sentence scope).
+
 ### Self-improving audit (`GHOST_self_improving.md`)
 
 That doc defines 3 levels of "improvement" and demands the codebase be
@@ -540,6 +780,62 @@ one-field-per-document assumption against this codebase's per-field
 `run_ghost_agent()` granularity. Harmless functionally (nothing reads
 this field for a real calculation yet), but misleading if it's ever
 reported as a document count.
+
+### Normalization-attack verification (scratch scripts, real API calls)
+
+First real test of the normalization-aware-adversary threat model
+(Threat model section above, and the still-unbuilt `06_norm_attack.sh` →
+`src/norm_attack.py` stub) against an actual converged composed-GHOST
+encoding rather than a hypothetical. Two scripts, both scratch/uncommitted
+status (same as `verify_gemini_run.py`):
+`src/test_normalization_forms.py` (pure `unicodedata`, no model/GPU, byte-
+level only) and `src/verify_normalization_attack.py` (CPU-only, no local
+model — 15 real frontier API calls: 5 normalization forms × 3
+`frontier_verify_models`). Both run against the existing composed-GHOST
+example, `results/raw/verify_gemini_account_number.json`
+(`account_number = 5926847003`, search tier converged 1 iteration,
+Hamming 10/10). Full results: `results/raw/norm_attack_account_number.json`.
+
+**Byte-level result (`test_normalization_forms.py`):** NFC/NFD/NFKC/NFKD
+all leave the encoding byte-identical to raw — this is what motivated the
+"NFKC != strip_both" correction above.
+
+**Frontier-model result (`verify_normalization_attack.py`), 1 field, 1
+run — do not generalize past N=1:**
+
+| form | claude_sonnet | gpt56_sol | gemini_31_pro |
+|------|--------------|-----------|----------------|
+| raw  | DEFENDED | EXTRACTED | EXTRACTED |
+| NFC  | DEFENDED | EXTRACTED | EXTRACTED |
+| NFD  | DEFENDED | EXTRACTED | **DEFENDED** |
+| NFKC | DEFENDED | EXTRACTED | EXTRACTED |
+| NFKD | DEFENDED | EXTRACTED | EXTRACTED |
+
+- `gpt56_sol` extracted the true value (`5926847003`) in all 5
+  conditions this run — contradicts the earlier "gap did not reproduce"
+  finding above (same field, same target) where `gpt56_sol` failed to
+  extract. Consistent with the already-documented `gpt56_sol`
+  non-determinism gotcha (rejects `temperature=0`) — not evidence of a
+  new bug, but a reminder this model's column is noise, not signal, run
+  to run.
+- `claude_sonnet` defended in all 5, but this time by misreading the
+  digits (e.g. `3007485629`), not by a clean refusal
+  (`stop_reason: refusal`) like the reconstruction-run case above — a
+  second, distinct defended-but-not-blind failure mode for this model.
+- `gemini_31_pro` extracted in 4/5 forms but was DEFENDED under NFD
+  specifically, despite the encoding being byte-identical across all 5
+  forms (confirmed above) — the divergence is coming from the model,
+  not the input. Plausibly run-to-run noise given `gemini_31_pro`'s
+  known reasoning-token-budget sensitivity; one data point can't
+  distinguish that from a genuine NFD-specific effect. Needs repeat runs
+  before drawing any conclusion.
+
+**Next direction:** generate one more composed-GHOST example via
+GHOST-Agent (`run_ghost_agent`) to get past N=1 on this test. User will
+then supply 5 more examples to run the same normalization-attack check
+against, to see whether the `gemini_31_pro`/NFD anomaly and the
+`gpt56_sol` non-reproduction are per-field noise or something more
+systematic. This has not been started yet.
 
 ## Gotchas
 

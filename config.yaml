@@ -67,6 +67,12 @@ encoding_conditions:
   - vs_only
   - bidi_only
   - bidi_permute
+  - bidi_permute_sentence   # Mechanism 2 applied to the SENTENCE containing
+                            # each field, not just the field span -- see
+                            # sentence-level obfuscation plan. Never
+                            # collapsed with bidi_permute (separate
+                            # measured condition, same convention as
+                            # NFKC != strip_both above).
   - ghost
   - ghost_nfkc
   - ghost_permute
@@ -107,6 +113,70 @@ local_models:
     max_new_tokens: 50
     dtype: "bfloat16"      # only genuinely DeepSeek-native tokenizer we have;
                            # deepseek_r1_14b is a Qwen-tokenizer distill
+# NOTE: deepseek_r1_32b is NOT listed here in local_models -- it is only
+# ever used as an agent_backbones entry below (its own self-contained
+# hf_id/dtype/quantization spec there), never as a search-tier ensemble
+# member, so it doesn't belong in this adversary-side model registry.
+
+# ── Agent backbone (GHOST-Agent's agent role, distinct from the models
+# above, which are all ADVERSARY-side: proxy/target/ensemble/verify) ────
+# GHOST_AGENT_TASKS.md's CRITICAL RULE 5 originally fixed the agent
+# model to claude-sonnet-4-6. This section makes that a config-driven
+# ablation axis instead (src/agent_backbone.py) -- e.g. to compare
+# Claude Sonnet vs. a free-to-run local reasoning model as the thing
+# that PROPOSES encodings, holding the adversary ensemble/verify tiers
+# fixed. `provider: anthropic` entries reuse api_models-style fields
+# (model_id); `provider: local` entries reuse local_models-style fields
+# (hf_id/dtype/max_new_tokens/strip_think_tags) but are kept as their
+# own entries below rather than pointed at agent_ensemble.members,
+# because deepseek_r1_14b is ALSO a search-tier ensemble member above --
+# using the identical loaded weights as both proposer and one of the
+# panel voting on it would be circular (same risk already called out for
+# excluding qwen25_7b from agent_ensemble.members, since it's the
+# encoding-time proxy). If deepseek_r1_14b is ever used as agent_backbone
+# for a real ablation run, exclude it from agent_ensemble.members for
+# that run, or treat any "defended" verdict from it with the same
+# skepticism as a proxy grading its own homework.
+agent_backbones:
+  default: claude_sonnet
+  options:
+    claude_sonnet:
+      provider: "anthropic"
+      model_id: "claude-sonnet-4-6"
+    claude_haiku:
+      provider: "anthropic"
+      model_id: "claude-haiku-4-5"
+    claude_opus:
+      provider: "anthropic"
+      model_id: "claude-opus-4-6"
+    deepseek_r1_14b:
+      provider: "local"
+      hf_id: "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+      max_new_tokens: 4000
+      dtype: "bfloat16"
+      strip_think_tags: true  # see caveat above: also an ensemble member --
+                               # exclude from agent_ensemble.members when
+                               # using this as the backbone
+    deepseek_r1_32b:
+      provider: "local"
+      hf_id: "deepseek-ai/DeepSeek-R1-Distill-Qwen-32B"
+      max_new_tokens: 4000
+      dtype: "bfloat16"       # base dtype before quantization is applied
+      quantization: "8bit"    # bitsandbytes load_in_8bit -- ~32-34GB VRAM
+                              # instead of ~64-66GB at plain bf16. Adopted
+                              # after TWO real failures at bf16 on this
+                              # node: (1) OOM when the resident backbone
+                              # collided with an ensemble member's own GPU
+                              # residency mid-run, and (2) even before
+                              # that, from_pretrained's checkpoint-shard
+                              # staging in host RAM exceeded a 60GB SLURM
+                              # --mem allocation and got SIGKILLed (exit
+                              # 137) before any GPU work started. 8-bit
+                              # fixes both at once. Introduces quantization
+                              # noise as an uncharacterised variable in
+                              # the encoding-search results -- not yet
+                              # measured against an unquantized run.
+      strip_think_tags: true  # NOT an ensemble member -- no self-grading risk
 
 api_models:
   gpt55:

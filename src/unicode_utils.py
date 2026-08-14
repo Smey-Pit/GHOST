@@ -91,6 +91,21 @@ def apply_nfkc(text: str) -> str:
     return unicodedata.normalize('NFKC', text)
 
 
+def apply_nfc(text: str) -> str:
+    """Apply NFC normalization (normalization attack)."""
+    return unicodedata.normalize('NFC', text)
+
+
+def apply_nfd(text: str) -> str:
+    """Apply NFD normalization (normalization attack)."""
+    return unicodedata.normalize('NFD', text)
+
+
+def apply_nfkd(text: str) -> str:
+    """Apply NFKD normalization (normalization attack)."""
+    return unicodedata.normalize('NFKD', text)
+
+
 def strip_think_tags(text: str) -> str:
     """
     Strip <think>...</think> blocks from DeepSeek-R1 outputs.

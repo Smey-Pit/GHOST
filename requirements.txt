@@ -13,6 +13,19 @@ transformers>=4.47.0
 accelerate>=0.33.0
 sentencepiece
 protobuf
+bitsandbytes>=0.43.0   # 8-bit quantization for the deepseek_r1_32b agent
+                       # backbone ONLY (agent_backbones.options, never the
+                       # search-tier ensemble members) -- unquantized bf16
+                       # for a 32B model needs ~64GB host RAM to stage
+                       # during from_pretrained's shard loading, which
+                       # exceeded a 60GB SLURM --mem allocation and got
+                       # SIGKILLed (exit 137) before any GPU work even
+                       # started. 8-bit halves both the host-RAM staging
+                       # footprint and the resident VRAM footprint
+                       # (~32-34GB), letting it coexist with an ensemble
+                       # member without the CPU<->GPU offload round-trip
+                       # agent_backbone.py's release_gpu()/reacquire_gpu()
+                       # otherwise does.
 
 # Dataset generation
 faker==24.0.0

@@ -15,6 +15,7 @@ oracle used in __main__ verification -- this is the same UAX#9
 implementation real renderers use, not a hand-rolled approximation.
 """
 import random
+import string
 from bidi import get_display
 
 RLI, LRI, FSI, PDI = '⁧', '⁦', '⁨', '⁩'
@@ -137,15 +138,46 @@ def hamming(a, b):
 
 
 def find_target_permutation(field, trials=2000, seed=0):
+    """
+    Search for the separable permutation of `field` maximizing Hamming
+    distance from identity, SUBJECT TO round-trip correctness: a
+    candidate is only considered if encode_permutation(field, perm)
+    actually renders back to `field` via the real UAX#9 oracle.
+
+    This filter is required for general text -- it was never needed for
+    the digit-only fields this module was originally built for (their
+    round-trip always held), but real prose contains neutral/weak
+    bidi-type characters (spaces, punctuation) whose UAX#9 resolution
+    (W1-W7/N1-N2 neutral rules) can differ from the naive "every
+    character is an independently reorderable opaque unit" assumption
+    this module's construction makes, DEPENDING on where that neutral
+    character lands in the specific permutation chosen -- confirmed for
+    real (src/bidi_permute.py's sentence-scale self-test measured a real
+    ~10-30% failure rate on realistic sentence-like text before this
+    filter existed, purely because the search only ever optimized
+    Hamming distance and never verified the thing it was supposed to
+    guarantee). Field-length digit content is unaffected in practice
+    (round-trip already always held there) but now gets verified
+    instead of assumed, at the cost of a real bidi.get_display() oracle
+    call per trial instead of a cheap integer comparison.
+
+    Returns (None, None) if no candidate round-trips within `trials` --
+    callers must handle this (see encode_field).
+    """
     n = len(field)
     rng = random.Random(seed)
     identity = list(range(n))
     best = None
     for _ in range(trials):
         perm = random_separable_perm(n, rng)
+        enc = encode_permutation(field, perm)
+        if enc is None or visible(enc) != field:
+            continue
         d = hamming(perm, identity)
         if best is None or d > best[0]:
             best = (d, perm)
+    if best is None:
+        return None, None
     return best
 
 
@@ -153,8 +185,15 @@ def encode_field(field, trials=2000, seed=0):
     """
     End-to-end: find the farthest separable permutation of `field`'s digits
     and return (encoded_string, stored_order_string, hamming_distance).
+
+    Returns (None, None, 0) if the search exhausted `trials` without
+    finding a permutation that round-trips (see find_target_permutation) --
+    callers must treat this the same as any other invalid-encoding case
+    (mirroring encode_permutation's existing None-on-failure convention).
     """
     dist, perm = find_target_permutation(field, trials=trials, seed=seed)
+    if perm is None:
+        return None, None, 0
     enc = encode_permutation(field, perm)
     stored = ''.join(field[p] for p in perm)
     return enc, stored, dist
@@ -219,11 +258,117 @@ def _self_test(quiet=False):
     return ok == total
 
 
+# ---------- 4. sentence-scale de-risking (Phase 1, sentence-level obfuscation) ----------
+
+# UAX#9 caps explicit embedding levels at 125 -- a real hard limit real
+# renderers implement, not a soft guideline. encode()'s recursive isolate/
+# override nesting for an unbalanced decompose() tree could plausibly
+# approach or exceed this at sentence length (never exercised before --
+# every prior use of this module was on 2-12 char fields). This has never
+# been measured anywhere in this codebase before this self-test.
+MAX_UAX9_EMBEDDING_DEPTH = 125
+
+_PUSH = {RLI, LRI, FSI, RLO, LRO}
+_POP = {PDI, PDF}
+
+
+def max_nesting_depth(encoded: str) -> int:
+    """
+    Approximate the peak bidi embedding depth of an encoded string by
+    tracking a running counter: +1 on any isolate/override-opening control
+    (RLI/LRI/FSI/RLO/LRO), -1 on any closing control (PDI/PDF). encode()
+    constructs these in properly matched (isolate-opener -> PDI,
+    override-opener -> PDF) pairs by design, so a single counter is a
+    faithful proxy for the real embedding level UAX#9 tracks, without
+    needing to reimplement the full bidi algorithm's paragraph-level
+    resolution just to measure nesting depth.
+    """
+    depth = 0
+    peak = 0
+    for c in encoded:
+        if c in _PUSH:
+            depth += 1
+            peak = max(peak, depth)
+        elif c in _POP:
+            depth -= 1
+    return peak
+
+
+def _random_sentence_like(rng, n):
+    """
+    Realistic sentence-shaped text for the scale test -- letters, spaces,
+    and punctuation, not just a digit alphabet like _self_test() uses.
+    Approximates real carrier sentences (e.g. "The value is 5926847003."
+    from dataset.py's phrase templates, or Track A's narrative prose).
+    """
+    alphabet = string.ascii_letters + string.digits + ' .,-'
+    # Weight space more heavily so word-like chunks emerge, closer to real
+    # prose than a uniform character draw.
+    weighted = alphabet + ' ' * 8
+    return ''.join(rng.choice(weighted) for _ in range(n))
+
+
+def _self_test_sentence_scale(lengths=(20, 50, 100, 200, 400), trials=500, quiet=False):
+    """
+    De-risks bidi_permute at sentence length BEFORE any pipeline wiring
+    (see plan: sentence-level obfuscation, Phase 1 gate). Three checks per
+    trial, all against the real UAX#9 oracle/limit, none against a mock:
+      1. search quality -- Hamming distance achieved vs. length, at the
+         SAME trial budget (500) already used in production (config.yaml's
+         bidi_permute_search_trials)
+      2. round-trip fidelity -- visible(encode(...)) == original, via the
+         real python-bidi oracle (same check _self_test() already does)
+      3. peak embedding depth vs. MAX_UAX9_EMBEDDING_DEPTH (125) -- the
+         one dimension _self_test() never measured because it never
+         mattered at field length
+    """
+    rng = random.Random(1337)
+    results = []
+    worst_depth = 0
+    all_round_trip_ok = True
+    for n in lengths:
+        for trial_i in range(10):
+            text = _random_sentence_like(rng, n)
+            enc, stored, dist = encode_field(text, trials=trials, seed=rng.randint(0, 10**6))
+            round_trip_ok = enc is not None and visible(enc) == text
+            depth = max_nesting_depth(enc) if enc is not None else -1
+            worst_depth = max(worst_depth, depth)
+            all_round_trip_ok = all_round_trip_ok and round_trip_ok
+            results.append({
+                'n': n, 'trial': trial_i, 'hamming': dist,
+                'hamming_ratio': dist / n if n else 0.0,
+                'round_trip_ok': round_trip_ok, 'depth': depth,
+            })
+            if not round_trip_ok and not quiet:
+                print(f"FAIL round-trip n={n} trial={trial_i} text={text!r}")
+
+    if not quiet:
+        for n in lengths:
+            rows = [r for r in results if r['n'] == n]
+            mean_ratio = sum(r['hamming_ratio'] for r in rows) / len(rows)
+            max_depth_n = max(r['depth'] for r in rows)
+            print(f"n={n:4d}: mean hamming_ratio={mean_ratio:.3f}  "
+                  f"max_depth={max_depth_n}  round_trip_ok={all(r['round_trip_ok'] for r in rows)}")
+        print(f"\nWorst embedding depth observed: {worst_depth} "
+              f"(UAX#9 limit: {MAX_UAX9_EMBEDDING_DEPTH})")
+        print(f"All round-trips OK: {all_round_trip_ok}")
+
+    depth_ok = worst_depth < MAX_UAX9_EMBEDDING_DEPTH
+    passed = all_round_trip_ok and depth_ok
+    if not quiet:
+        print(f"\nDECISION GATE: {'PASS' if passed else 'FAIL'} "
+              f"(round_trip_ok={all_round_trip_ok}, depth_ok={depth_ok})")
+    return {'passed': passed, 'results': results, 'worst_depth': worst_depth}
+
+
 if __name__ == '__main__':
     import sys
     args = sys.argv[1:]
     if args and args[0] == '--selftest':
         _self_test()
+    elif args and args[0] == '--selftest-sentence':
+        result = _self_test_sentence_scale()
+        sys.exit(0 if result['passed'] else 1)
     elif args and args[0] == '--compare':
         print(format_comparison(args[1]))
     elif args:

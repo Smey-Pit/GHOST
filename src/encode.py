@@ -45,6 +45,7 @@ from unicode_utils import (  # noqa: E402
 from bidi_permute import (  # noqa: E402
     decompose, encode as bidi_permute_encode, find_target_permutation,
 )
+from sentence_utils import find_field_sentence  # noqa: E402
 
 # Conditions that require the proxy model for logprob-guided VS injection.
 VS_DEPENDENT_CONDITIONS = {"vs_only", "ghost", "ghost_permute"}
@@ -190,6 +191,58 @@ def _apply_field_transform(item, transform_fn):
         return {**item, "text": text}
 
 
+def _apply_sentence_transform(item, transform_fn, char_spans=None):
+    """
+    Sentence-scope counterpart to _apply_field_transform: applies
+    transform_fn(sentence_text) -> encoded_sentence to the SENTENCE
+    containing each field (located via sentence_utils.find_field_sentence),
+    not the field's own span -- see the sentence-level obfuscation plan
+    for why (removes contextual scaffolding an adversary could otherwise
+    use to reconstruct a garbled field).
+
+    Multiple fields can share one sentence (confirmed in Track A's real
+    documents), so sentences are deduped by their text before
+    transforming -- encoding + splicing the same sentence twice would
+    corrupt it (the second text.find/replace would look for a sentence
+    that no longer exists post-encoding).
+
+    Args:
+        item: document dict with "text" and "fields"
+        transform_fn: sentence_text -> encoded_sentence
+        char_spans: optional {field_name: (start, end)} map (Track A
+            format) -- ALWAYS pass this when available; without it,
+            sentence location falls back to text.find(field_value)
+            (fine for data/raw/documents.json, where every field's
+            phrase-template sentence is unique in the document, but
+            unsafe if a field value can repeat).
+
+    Returns:
+        New item dict with "text" updated and "fields" (ground truth)
+        UNCHANGED -- field values are never altered, only permuted in
+        place within whichever sentence contains them.
+    """
+    if "fields" not in item:
+        raise ValueError("_apply_sentence_transform requires item['fields']")
+
+    text = item["text"]
+    encoded_by_sentence = {}  # sentence_text -> encoded_sentence, dedup cache
+    for field_name, field_value in item["fields"].items():
+        if not field_value:
+            continue
+        char_span = char_spans.get(field_name) if char_spans else None
+        located = find_field_sentence(text, field_value, char_span=char_span)
+        if located is None:
+            continue  # field not locatable in text -- leave untouched
+        sentence_text, _, _ = located
+        if sentence_text not in encoded_by_sentence:
+            encoded_by_sentence[sentence_text] = transform_fn(sentence_text)
+
+    for sentence_text, encoded_sentence in encoded_by_sentence.items():
+        text = text.replace(sentence_text, encoded_sentence, 1)
+
+    return {**item, "text": text, "fields": dict(item["fields"])}
+
+
 def encode_clean(item):
     return dict(item)
 
@@ -235,21 +288,78 @@ def encode_bidi_permute(item, trials, seed, salt):
     bidi isolates/overrides. See src/bidi_permute.py.
 
     The search seed is derived per (item, field), not reused globally --
-    find_target_permutation picks its candidate purely by structure
-    (Hamming distance from identity), never looking at the field's
-    actual characters, so a single shared seed would give every field
-    of the same length the IDENTICAL stored permutation across the whole
-    corpus: directly invertible from a handful of examples, not just
-    detectable.
+    find_target_permutation's CANDIDATE GENERATION picks purely by
+    structure (Hamming distance from identity), never looking at the
+    field's actual characters, so a single shared seed would give every
+    field of the same length the IDENTICAL stored permutation across the
+    whole corpus: directly invertible from a handful of examples, not
+    just detectable. (find_target_permutation's round-trip FILTER does
+    look at the actual characters -- required for general text, see its
+    docstring -- but that filter only rejects/accepts candidates the
+    seed already generated; it doesn't change what the seed determines.)
     """
     def transform(field_value, field_name):
         if not field_value:
             return field_value
         field_seed = _derive_int_seed(seed, salt, "bidi_permute", item["id"], field_name)
         _, perm = find_target_permutation(field_value, trials=trials, seed=field_seed)
+        if perm is None:
+            # Loud failure, not a silent fallback to unencoded content --
+            # a silently weaker encoding here would be invisible in the
+            # output the same way a shared/predictable payload would be
+            # (see derive_payload_bytes's rationale). In practice this
+            # has never been observed for digit-only field content (see
+            # bidi_permute.py's field-length self-test, 330/330 verified)
+            # -- it exists for when this same function is pointed at
+            # longer/general text (sentence-level obfuscation).
+            raise RuntimeError(
+                f"find_target_permutation found no round-tripping "
+                f"permutation for field_name={field_name!r} "
+                f"value={field_value!r} within {trials} trials"
+            )
         tree = decompose(tuple(perm))
         return bidi_permute_encode(tree, field_value)
     return _apply_field_transform(item, transform)
+
+
+def encode_bidi_permute_sentence(item, trials, seed, salt, char_spans=None):
+    """
+    Sentence-scope variant of encode_bidi_permute: same permutation-
+    search-and-encode mechanism, applied to the SENTENCE containing each
+    field (via _apply_sentence_transform) instead of the bare field
+    value. See the sentence-level obfuscation plan for the rationale
+    (removing contextual scaffolding around the field) and
+    bidi_permute.py's find_target_permutation docstring for why the
+    round-trip-correctness search filter was required before this was
+    safe to do on general prose at all (digit-only fields never needed
+    it; real sentences do, confirmed by a real ~10-30% round-trip
+    failure rate before that filter existed).
+
+    char_spans: optional {field_name: (start, end)} map (Track A's
+        pilot_fields.jsonl format) -- see _apply_sentence_transform.
+        None falls back to text.find(field_value) per-field (fine for
+        data/raw/documents.json, where dataset.py's phrase-template
+        sentences make each field's carrier sentence unique in the
+        document).
+
+    Ground truth is unchanged (same guarantee as encode_bidi_permute):
+    only the sentence's characters are permuted, never the field's own
+    recorded value.
+    """
+    def transform(sentence_text):
+        sentence_seed = _derive_int_seed(
+            seed, salt, "bidi_permute_sentence", item["id"], sentence_text,
+        )
+        _, perm = find_target_permutation(sentence_text, trials=trials, seed=sentence_seed)
+        if perm is None:
+            raise RuntimeError(
+                f"find_target_permutation found no round-tripping "
+                f"permutation for sentence={sentence_text!r} within "
+                f"{trials} trials"
+            )
+        tree = decompose(tuple(perm))
+        return bidi_permute_encode(tree, sentence_text)
+    return _apply_sentence_transform(item, transform, char_spans=char_spans)
 
 
 def encode_ghost_permute(item, proxy, seed, salt, threshold_tau, stats, trials):
@@ -264,6 +374,14 @@ def encode_ghost_permute(item, proxy, seed, salt, threshold_tau, stats, trials):
             return field_value
         field_seed = _derive_int_seed(seed, salt, "ghost_permute", item["id"], field_name)
         _, perm = find_target_permutation(field_value, trials=trials, seed=field_seed)
+        if perm is None:
+            # See encode_bidi_permute's identical guard for why this is a
+            # loud failure, not a silent fallback.
+            raise RuntimeError(
+                f"find_target_permutation found no round-tripping "
+                f"permutation for field_name={field_name!r} "
+                f"value={field_value!r} within {trials} trials"
+            )
         tree = decompose(tuple(perm))
         chars_by_original_pos = [None] * len(field_value)
         for orig_pos in perm:
@@ -517,6 +635,8 @@ def encode_condition(condition, items, config, checkpoint_path, proxy=None, aux=
             encoded = encode_bidi_only(item)
         elif condition == "bidi_permute":
             encoded = encode_bidi_permute(item, bidi_permute_trials, seed, salt)
+        elif condition == "bidi_permute_sentence":
+            encoded = encode_bidi_permute_sentence(item, bidi_permute_trials, seed, salt)
         elif condition == "vs_only":
             encoded = encode_vs_only(item, proxy, seed, salt, tau, stats)
         elif condition == "ghost":

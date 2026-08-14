@@ -19,8 +19,14 @@ TMP_OUTPUT_DIR = "../results/tables/_smoke_test_task6"
 
 def fake_run_ghost_agent(
     target, field_name, ensemble_members, consensus_threshold,
-    clean_floor_check, max_iterations, verbose,
+    clean_floor_check, max_iterations, verbose, **kwargs,
 ):
+    # **kwargs absorbs doc_index/use_memory/backbone -- convergence.py
+    # passes these through to run_ghost_agent_fn but this fake stand-in
+    # doesn't need any of them (pre-existing signature drift from before
+    # those params existed; fixed here rather than left broken since
+    # this is the same call site agent_backbone's `backbone` param was
+    # just added to).
     # Deterministic stand-in: "succeeds" for odd-length targets, to get
     # a mix of True/False in the summary without needing real inference.
     success = len(target) % 2 == 1

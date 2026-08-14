@@ -49,6 +49,7 @@ from ghost_tools import (  # noqa: E402
 )
 from ghost_tools_structural import tool_analyse_structure  # noqa: E402
 from ensemble import load_ensemble_config  # noqa: E402
+from agent_backbone import resolve_backbone  # noqa: E402
 import strategy_memory  # noqa: E402
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -86,6 +87,7 @@ def run_convergence_analysis(
     output_dir: str = None,
     start_index: int = 0,
     use_memory: bool = True,
+    agent_backbone_name: str = None,
     run_ghost_agent_fn: Callable = run_ghost_agent,
 ) -> list:
     """
@@ -119,6 +121,14 @@ def run_convergence_analysis(
         use_memory: passed straight through to run_ghost_agent --
             False disables strategy_memory.py entirely, reproducing
             this function's pre-memory behaviour.
+        agent_backbone_name: key into config.yaml's agent_backbones.options
+            (see src/agent_backbone.py). None reproduces the pre-backbone-
+            ablation default (claude-sonnet-4-6 via run_ghost_agent's own
+            back-compat path). When given, the backbone is constructed
+            ONCE here and reused across every field/document in this run
+            (not per-field) -- for a local backbone this is the difference
+            between loading weights once vs. hundreds of times; see
+            agent_backbone.LocalReActBackbone's docstring.
         run_ghost_agent_fn: defaults to ghost_agent.run_ghost_agent --
             overridable for tests so this can run without a GPU or a
             real Anthropic API key
@@ -141,70 +151,85 @@ def run_convergence_analysis(
 
     results = []
 
-    for i, doc in enumerate(sampled):
-        global_doc_index = start_index + i
-        domain = doc["domain"]
-        doc_id = doc["id"]
+    backbone = None
+    if agent_backbone_name is not None:
+        backbone = resolve_backbone(agent_backbone_name, config)
+    backbone_label = agent_backbone_name or config["agent_backbones"]["default"]
 
-        for field_name, field_value in doc["fields"].items():
-            print(f"\n[doc_index={global_doc_index}] {doc_id} / "
-                  f"{field_name}: '{field_value}'")
+    try:
+        for i, doc in enumerate(sampled):
+            global_doc_index = start_index + i
+            domain = doc["domain"]
+            doc_id = doc["id"]
 
-            static = run_static_ghost(field_value)
-            content_type = tool_analyse_structure(field_value)["content_type"]
+            for field_name, field_value in doc["fields"].items():
+                print(f"\n[doc_index={global_doc_index}] {doc_id} / "
+                      f"{field_name}: '{field_value}'")
 
-            agent_result = run_ghost_agent_fn(
-                target=field_value,
-                field_name=field_name,
-                ensemble_members=ensemble_config["members"],
-                consensus_threshold=ensemble_config["consensus_threshold"],
-                clean_floor_check=ensemble_config["clean_floor_check"],
-                max_iterations=max_iterations,
-                verbose=False,
-                doc_index=global_doc_index,
-                use_memory=use_memory,
-            )
+                static = run_static_ghost(field_value)
+                content_type = tool_analyse_structure(field_value)["content_type"]
 
-            row = {
-                "doc_index": global_doc_index,
-                "doc_id": doc_id,
-                "domain": domain,
-                "field_name": field_name,
-                "field_value": field_value,
-                "field_length": len(field_value),
-                "content_type": content_type,
-                "static_hamming": static["hamming"],
-                "static_valid": static["valid"],
-                "agent_success": agent_result["success"],
-                "agent_iterations": agent_result["n_iterations"],
-                "agent_hamming": agent_result["final_hamming"],
-                "agent_improvement":
-                    agent_result["final_hamming"] - static["hamming"],
-                "n_principles_available":
-                    agent_result.get("n_principles_available", 0),
-            }
-            results.append(row)
-            print(
-                f"  Static hamming: {static['hamming']}  "
-                f"Agent: success={agent_result['success']} "
-                f"iters={agent_result['n_iterations']} "
-                f"hamming={agent_result['final_hamming']} "
-                f"principles_used={row['n_principles_available']}"
-            )
+                agent_result = run_ghost_agent_fn(
+                    target=field_value,
+                    field_name=field_name,
+                    ensemble_members=ensemble_config["members"],
+                    consensus_threshold=ensemble_config["consensus_threshold"],
+                    clean_floor_check=ensemble_config["clean_floor_check"],
+                    max_iterations=max_iterations,
+                    verbose=False,
+                    backbone=backbone,
+                    doc_index=global_doc_index,
+                    use_memory=use_memory,
+                )
 
-        if use_memory:
-            # One document = one increment, regardless of how many
-            # fields it has or whether any of them succeeded --
-            # counting "documents processed" at the field level (as
-            # ghost_agent.py used to) overcounts by ~4x (this dataset's
-            # avg fields/doc). This is the only place in the codebase
-            # that actually knows where one document ends and the next
-            # begins, so it's the only correct place for this counter.
-            current_memory = strategy_memory.load_memory()
-            current_memory["n_documents_processed"] = (
-                current_memory.get("n_documents_processed", 0) + 1
-            )
-            strategy_memory.save_memory(current_memory)
+                row = {
+                    "doc_index": global_doc_index,
+                    "doc_id": doc_id,
+                    "domain": domain,
+                    "field_name": field_name,
+                    "field_value": field_value,
+                    "field_length": len(field_value),
+                    "content_type": content_type,
+                    "agent_backbone": backbone_label,
+                    "static_hamming": static["hamming"],
+                    "static_valid": static["valid"],
+                    "agent_success": agent_result["success"],
+                    "agent_iterations": agent_result["n_iterations"],
+                    "agent_hamming": agent_result["final_hamming"],
+                    "agent_improvement":
+                        agent_result["final_hamming"] - static["hamming"],
+                    "n_principles_available":
+                        agent_result.get("n_principles_available", 0),
+                }
+                results.append(row)
+                print(
+                    f"  Static hamming: {static['hamming']}  "
+                    f"Agent: success={agent_result['success']} "
+                    f"iters={agent_result['n_iterations']} "
+                    f"hamming={agent_result['final_hamming']} "
+                    f"principles_used={row['n_principles_available']}"
+                )
+
+            if use_memory:
+                # One document = one increment, regardless of how many
+                # fields it has or whether any of them succeeded --
+                # counting "documents processed" at the field level (as
+                # ghost_agent.py used to) overcounts by ~4x (this dataset's
+                # avg fields/doc). This is the only place in the codebase
+                # that actually knows where one document ends and the next
+                # begins, so it's the only correct place for this counter.
+                current_memory = strategy_memory.load_memory()
+                current_memory["n_documents_processed"] = (
+                    current_memory.get("n_documents_processed", 0) + 1
+                )
+                strategy_memory.save_memory(current_memory)
+    finally:
+        # Only close a backbone constructed HERE (agent_backbone_name
+        # given) -- None means run_ghost_agent built its own default
+        # AnthropicBackbone per call and already closed it itself (a
+        # no-op for that backbone anyway, but keeps ownership clear).
+        if backbone is not None:
+            backbone.close()
 
     out_path = os.path.join(output_dir, "agent_convergence.csv")
     if results:
@@ -283,6 +308,15 @@ if __name__ == "__main__":
         "--no_memory", action="store_true",
         help="disable strategy_memory.py (Level 3 persistence) entirely",
     )
+    parser.add_argument(
+        "--agent_backbone", default=None,
+        help=(
+            "Key into config.yaml's agent_backbones.options (e.g. "
+            "claude_haiku, deepseek_r1_32b) -- selects the agent role's "
+            "backbone for a backbone ablation run. Omit to use the "
+            "pre-ablation default (claude-sonnet-4-6)."
+        ),
+    )
     args = parser.parse_args()
 
     run_convergence_analysis(
@@ -294,4 +328,5 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         start_index=args.start_index,
         use_memory=not args.no_memory,
+        agent_backbone_name=args.agent_backbone,
     )
