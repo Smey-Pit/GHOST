@@ -343,7 +343,12 @@ def process_instance(tokenizer, model, domain: str, doc_index: int,
             continue
         reported = matches[0]
         value = reported.get("value")
-        field_type = reported.get("field_type", DOMAIN_FIELDS[domain][field_name]["field_type"])
+        # field_name is already validated against DOMAIN_FIELDS at this point,
+        # so the schema's field_type is authoritative -- the model's own
+        # self-reported "field_type" is unreliable (it has echoed back the
+        # description's example VALUE instead of the type name, e.g. 'PTY LTD'
+        # instead of 'category_code', which crashes validate_field's lookup).
+        field_type = DOMAIN_FIELDS[domain][field_name]["field_type"]
         char_span = reported.get("char_span")
 
         if not isinstance(value, str) or not value:
