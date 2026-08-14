@@ -1,0 +1,208 @@
+"""
+src/ensemble.py
+
+Search-tier adversary ensemble for GHOST-Agent (extends Task 2 of
+GHOST_AGENT_TASKS.md; see config.yaml's agent_ensemble section).
+
+Owns the load-once / query-many / unload lifecycle for the local HF
+models in agent_ensemble.members -- reloading a 7-14B model per field
+query would defeat the entire cost rationale for using an open-source
+ensemble as a search-time proxy instead of frontier APIs. Models are
+loaded ONE AT A TIME on the shared GPU and unloaded before the next,
+mirroring src/encode.py's proxy-model convention.
+
+This module answers exactly one question per call: does a supermajority
+of the ensemble fail to extract the target from encoded_text? That
+verdict drives the agent's stopping condition during search. It is
+NEVER the paper's reported number -- config.yaml's
+agent_ensemble.frontier_verify_models is the tier that gets reported,
+and the gap between the two tiers should itself be measured and
+reported (see project discussion: search-tier is a proxy, same status
+as the Qwen logprob proxy in encode.py).
+"""
+
+import gc
+import os
+import sys
+from typing import Callable, Optional
+
+sys.path.insert(0, os.path.dirname(__file__))
+from adversary import query_adversary_local, check_extraction  # noqa: E402
+
+
+# ── Model loading (real implementation; swappable for tests) ────────────
+
+def load_local_model(hf_id: str, dtype: str = "bfloat16"):
+    """
+    Load a HF causal LM + tokenizer onto the shared GPU.
+
+    Returns (tokenizer, model). For gated repos (meta-llama, mistralai)
+    this relies on the standard huggingface_hub auth flow already
+    configured in the environment -- not this function's concern.
+    """
+    import torch
+    from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    torch_dtype = getattr(torch, dtype)
+    tokenizer = AutoTokenizer.from_pretrained(hf_id)
+    model = AutoModelForCausalLM.from_pretrained(
+        hf_id, device_map="auto", torch_dtype=torch_dtype,
+    )
+    return tokenizer, model
+
+
+def unload_local_model(tokenizer, model) -> None:
+    """Free a loaded model's GPU memory before loading the next one."""
+    import torch
+
+    del model
+    del tokenizer
+    gc.collect()
+    torch.cuda.empty_cache()
+
+
+# ── Config resolution ─────────────────────────────────────────────────
+
+def load_ensemble_config(config: dict) -> dict:
+    """
+    Resolve config.yaml's agent_ensemble section into a ready-to-use
+    members list (local_models entries keyed by name) plus voting params.
+
+    Args:
+        config: the parsed config.yaml dict (see src/encode.py for the
+                yaml.safe_load convention used elsewhere in this repo)
+
+    Returns:
+        dict with keys: members (list of {name, hf_id, max_new_tokens,
+        dtype}), consensus_threshold (int), clean_floor_check (bool)
+    """
+    agent_ensemble = config["agent_ensemble"]
+    local_models = config["local_models"]
+
+    members = []
+    for name in agent_ensemble["members"]:
+        member_config = dict(local_models[name])
+        member_config["name"] = name
+        members.append(member_config)
+
+    return {
+        "members": members,
+        "consensus_threshold": agent_ensemble["consensus_threshold"],
+        "clean_floor_check": agent_ensemble["clean_floor_check"],
+    }
+
+
+# ── Ensemble orchestration ───────────────────────────────────────────────
+
+def run_ensemble_query(
+    encoded_text: str,
+    field_name: str,
+    ground_truth: str,
+    members: list,
+    consensus_threshold: int,
+    clean_reference_text: Optional[str] = None,
+    clean_reference_value: Optional[str] = None,
+    clean_floor_check: bool = True,
+    loader: Callable = load_local_model,
+    unloader: Callable = unload_local_model,
+    querier: Callable = query_adversary_local,
+    checker: Callable = check_extraction,
+) -> dict:
+    """
+    Run one field's encoded_text through every ensemble member, one at a
+    time, and return a consensus verdict.
+
+    A member's vote only counts if it passes the clean-floor check first
+    (can it extract clean_reference_value from clean_reference_text at
+    all?) -- otherwise a member's "failure" on encoded_text is as likely
+    to be weak instruction-following as a working defense, which would
+    corrupt the whole point of using real extraction failure as signal
+    (see GHOST_AGENT_TASKS.md's rationale for replacing the logprob
+    proxy). A refusal counts as "not extracted" here, consistent with
+    check_extraction and with this repo's convention that refusals are a
+    defense success.
+
+    Args:
+        encoded_text: the GHOST-encoded text to test
+        field_name: the field being extracted
+        ground_truth: the original (unencoded) field value
+        members: list of dicts, each with at least
+                 {"name": str, "hf_id": str, "max_new_tokens": int,
+                 "dtype": str} -- i.e. load_ensemble_config's output
+        consensus_threshold: number of valid (floor-check-passed)
+                 members that must fail extraction to declare the
+                 encoding defended
+        clean_reference_text / clean_reference_value: an unencoded
+                 sample used for the clean-floor check
+        clean_floor_check: set False to skip (e.g. tests where the
+                 mocked querier has no notion of "clean")
+        loader/unloader/querier/checker: dependency-injection points so
+                 this function is unit-testable without a GPU, and so
+                 reconstruction-mode callers (Phase 6 gradient /
+                 GHOST-Agent-on-natural-language) can swap in
+                 query_adversary_local(prompt_template=RECONSTRUCTION_
+                 PROMPT) + check_reconstruction without duplicating the
+                 load/unload/floor-check lifecycle. Real field-extraction
+                 callers use the defaults.
+
+    Returns:
+        dict with keys:
+          defended: bool — did >= consensus_threshold valid members fail?
+          n_valid: int — members that passed the clean-floor check
+          n_failed: int — valid members that did not extract correctly
+          per_member: list of per-member result dicts
+    """
+    if clean_floor_check and (
+        clean_reference_text is None or clean_reference_value is None
+    ):
+        raise ValueError(
+            "clean_floor_check requires clean_reference_text and "
+            "clean_reference_value"
+        )
+
+    per_member = []
+
+    for member in members:
+        tokenizer, model = loader(member["hf_id"], member.get("dtype", "bfloat16"))
+        max_new_tokens = member.get("max_new_tokens", 50)
+
+        try:
+            valid = True
+            floor_result = None
+            if clean_floor_check:
+                floor_response = querier(
+                    tokenizer, model, clean_reference_text,
+                    field_name, max_new_tokens,
+                )
+                floor_result = checker(
+                    floor_response, clean_reference_value,
+                )
+                valid = floor_result["extracted"]
+
+            response = querier(
+                tokenizer, model, encoded_text, field_name, max_new_tokens,
+            )
+            result = checker(response, ground_truth)
+
+            per_member.append({
+                "name": member["name"],
+                "hf_id": member["hf_id"],
+                "valid": valid,
+                "floor_check": floor_result,
+                "extracted": result["extracted"],
+                "refusal": result["refusal"],
+                "response": result["response"],
+            })
+        finally:
+            unloader(tokenizer, model)
+
+    valid_members = [m for m in per_member if m["valid"]]
+    n_valid = len(valid_members)
+    n_failed = sum(1 for m in valid_members if not m["extracted"])
+
+    return {
+        "defended": n_failed >= consensus_threshold,
+        "n_valid": n_valid,
+        "n_failed": n_failed,
+        "per_member": per_member,
+    }

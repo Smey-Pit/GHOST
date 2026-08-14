@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+data/raw/
+data/encoded/
+data/encoded_smoke/
+data/track_a/
+results/raw/
+results/tables/
+results/experience_log.jsonl
+results/strategy_memory.json
+logs/
+.checkpoint.*.json
+.env
+.claude/

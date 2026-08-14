@@ -1,0 +1,224 @@
+# ── Reproducibility ──────────────────────────────────────────
+seed: 168
+
+# ── Dataset ──────────────────────────────────────────────────
+n_per_domain: 250          # 250 per domain = 1000 main dataset
+                           # 95% CI half-width ~= +/-6% on FEA per domain (p=0.5 worst case)
+n_calibration_per_domain: 5  # disjoint from main set; used ONLY to calibrate
+                              # threshold_tau, never scored in results tables
+n_gradient: 100            # 20 per content type = 100 gradient subset
+domains:
+  - financial
+  - medical
+  - legal
+  - technical
+
+# ── Encoding ─────────────────────────────────────────────────
+threshold_tau: -8.0        # logprob threshold for VS injection stopping.
+                           # Calibrated on the disjoint calibration split
+                           # (20 docs, 807 chars) against the real proxy
+                           # model: -20.0 (original) was NEVER reached by
+                           # any character (807/807 exhausted the full
+                           # 28-byte payload) — too strict for this
+                           # model/payload. -8.0 gives median=6, p25=4
+                           # iterations (closest fit to the plan's own
+                           # "3-5 iterations typical" target) with only
+                           # a 2.85% tail maxing out. Re-run
+                           # `python src/encode.py --calibrate` if the
+                           # disruption_payload (salt) changes.
+disruption_payload: "ghost_obfuscation_payload_v1"
+                           # NOT injected literally anymore. It's a salt
+                           # mixed (with `seed` above, plus doc id / field
+                           # name / char index) into a keyed SHA-256 stream
+                           # (unicode_utils.derive_payload_bytes) that gives
+                           # EVERY character occurrence its own pseudorandom
+                           # payload. A single literal payload reused
+                           # everywhere would leave a fixed byte-sequence
+                           # signature repeated across the whole corpus --
+                           # strippable by pattern-matching alone, without
+                           # even needing to know it's VS ranges (strictly
+                           # weaker than the strip_vs ablation this paper
+                           # already evaluates). Same (seed, salt, context)
+                           # always reproduces the same bytes, so reruns and
+                           # checkpointing stay reproducible.
+
+bidi_permute_search_trials: 500   # random search width for the separable-
+                                   # permutation search in bidi_permute.py.
+                                   # Every field length tested (2-12 digits)
+                                   # reached a full derangement (max possible
+                                   # Hamming distance) well within this
+                                   # budget -- see src/bidi_permute.py
+                                   # --selftest. The search's own RNG seed is
+                                   # derived per (doc id, field name) from
+                                   # `seed`+`disruption_payload` above, NOT
+                                   # shared globally -- the search itself
+                                   # only looks at field LENGTH, never at
+                                   # the actual characters, so a shared seed
+                                   # would give every same-length field
+                                   # across the whole corpus the identical
+                                   # stored permutation: directly invertible
+                                   # from a handful of examples.
+
+encoding_conditions:
+  - clean
+  - bae
+  - textfooler
+  - homochar
+  - vs_only
+  - bidi_only
+  - bidi_permute
+  - ghost
+  - ghost_nfkc
+  - ghost_permute
+  - ghost_permute_nfkc
+
+# ── Models ───────────────────────────────────────────────────
+proxy_model: "Qwen/Qwen2.5-7B-Instruct"
+
+local_models:
+  llama32_3b:
+    hf_id: "meta-llama/Llama-3.2-3B-Instruct"
+    max_new_tokens: 50
+    dtype: "bfloat16"
+  llama31_8b:
+    hf_id: "meta-llama/Llama-3.1-8B-Instruct"
+    max_new_tokens: 50
+    dtype: "bfloat16"
+  qwen25_3b:
+    hf_id: "Qwen/Qwen2.5-3B-Instruct"
+    max_new_tokens: 50
+    dtype: "bfloat16"
+  qwen25_7b:
+    hf_id: "Qwen/Qwen2.5-7B-Instruct"
+    max_new_tokens: 50
+    dtype: "bfloat16"
+    is_proxy: true         # dual role: proxy + target
+  deepseek_r1_14b:
+    hf_id: "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B"
+    max_new_tokens: 2048   # reasoning model needs more tokens
+    dtype: "bfloat16"
+    strip_think_tags: true # strip <think>...</think> before eval
+  mistral7b:
+    hf_id: "mistralai/Mistral-7B-Instruct-v0.3"
+    max_new_tokens: 50
+    dtype: "bfloat16"
+  deepseek_llm_7b:
+    hf_id: "deepseek-ai/deepseek-llm-7b-chat"
+    max_new_tokens: 50
+    dtype: "bfloat16"      # only genuinely DeepSeek-native tokenizer we have;
+                           # deepseek_r1_14b is a Qwen-tokenizer distill
+
+api_models:
+  gpt55:
+    provider: "openai"
+    model_id: "gpt-5.5"
+    max_tokens: 50
+    temperature: 0
+  gpt56_sol:
+    provider: "openai"
+    model_id: "gpt-5.6-sol"
+    max_tokens: 2000       # reasoning model -- 50 silently burned the whole
+                           # budget on hidden reasoning tokens (finish_reason
+                           # "length", reasoning_tokens=50, zero visible
+                           # output), which check_extraction then read as a
+                           # failed extraction / defended verdict. That was
+                           # a false negative, not a real defense: with 2000
+                           # tokens the SAME encoded input was extracted
+                           # correctly. Same failure mode as deepseek_r1_14b
+                           # above, just never given the analogous bump.
+    temperature: 0         # rejected outright by this model at query time;
+                           # src/adversary.py's _call_openai retries without
+                           # it -- see CLAUDE.md gotcha on gpt56_sol determinism
+  claude_sonnet:
+    provider: "anthropic"
+    model_id: "claude-sonnet-4-6"
+    max_tokens: 50
+    temperature: 0
+  claude_opus:
+    provider: "anthropic"
+    model_id: "claude-opus-4-6"
+    max_tokens: 50
+    temperature: 0
+  gemini_31_pro:
+    provider: "google"
+    model_id: "gemini-3.1-pro-preview"
+    max_tokens: 2000       # reasoning model -- 50 silently burned the whole
+                           # budget on hidden thinking tokens (finish_reason
+                           # MAX_TOKENS, thoughts_token_count=47, zero visible
+                           # output/None text), which check_extraction would
+                           # read as a failed extraction / defended verdict.
+                           # That's a false negative, not a real defense: with
+                           # 2000 tokens the same prompt returned real text.
+                           # Same failure mode as gpt56_sol / deepseek_r1_14b
+                           # above, confirmed via a real smoke test, not the
+                           # SDK-migration bug this was originally suspected
+                           # to be.
+    temperature: 0
+
+# ── GHOST-Agent adversary tiers (GHOST_AGENT_TASKS.md) ─────────
+# Two separate roles, never conflated:
+#   search-tier  — cheap local ensemble, used INSIDE the agent's
+#                  generate/feedback/reflect/improve loop. This is a
+#                  proxy for cost reasons only, same status as the Qwen
+#                  logprob proxy above -- its "success" is never the
+#                  paper's reported number.
+#   verify-tier  — real frontier models, queried only on the converged
+#                  encoding (frontier_verify_every_n_iterations: 0), plus
+#                  a held-out calibration sample used to measure the
+#                  search/verify gap. THIS is what gets reported.
+agent_ensemble:
+  consensus_threshold: 3    # of N valid (floor-check-passed) members must
+                             # FAIL extraction to declare the encoding
+                             # defended at search time
+  clean_floor_check: true   # query each member on unencoded clean text
+                             # first; exclude its vote if it can't even
+                             # extract from that (weak instruction-following
+                             # != working defense)
+  members:                  # keys into local_models above. Chosen for
+                             # 4 distinct tokenizer families -- deliberately
+                             # excludes qwen25_7b/qwen25_3b since
+                             # deepseek_r1_14b already covers the Qwen
+                             # tokenizer family and qwen25_7b is the
+                             # encoding-time proxy (would be circular).
+    - llama31_8b
+    - mistral7b
+    - deepseek_r1_14b       # reasoning-style member; strip_think_tags
+                             # applied unconditionally in adversary.py,
+                             # not gated on this flag
+    - deepseek_llm_7b
+  frontier_verify_models:   # keys into api_models above
+    - claude_sonnet
+    - gpt56_sol
+    - gemini_31_pro
+  frontier_verify_every_n_iterations: 0  # 0 = only verify the final
+                             # converged encoding, never mid-search
+                             # (cost control -- see project memory on
+                             # search/verify gap reporting)
+
+# ── In-context defense ────────────────────────────────────────
+inctx_models:
+  - gpt56_sol
+  - claude_opus
+inctx_shots: [5, 10, 20]
+inctx_n_docs: 20           # evaluate on first 20 financial docs
+
+# ── Gradient subset ───────────────────────────────────────────
+gradient_types:
+  - random_digits
+  - formatted_identifiers
+  - alphanumeric_codes
+  - rare_proper_nouns
+  - natural_language
+gradient_n_per_type: 20
+
+# ── API rate limiting ─────────────────────────────────────────
+api_max_retries: 5
+api_retry_base_delay: 2.0  # seconds, exponential backoff
+api_requests_per_minute: 30
+
+# ── Paths ─────────────────────────────────────────────────────
+data_raw_dir: "data/raw"
+data_encoded_dir: "data/encoded"
+results_raw_dir: "results/raw"
+results_tables_dir: "results/tables"
+logs_dir: "logs"
