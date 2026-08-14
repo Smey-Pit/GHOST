@@ -7,8 +7,22 @@ independent Unicode-level failure modes are combined, not one: bidirectional
 override reversal (model tokenizes characters in a different order than a
 human sees) and logprob-guided Variation Selector injection (invisible
 characters that fragment familiar digit tokens into sequences the model has
-no learned representation for). Full background: `GHOST_BACKGROUND_FOR_CLAUDE_CODE.md`.
-Full pipeline/results spec: `GHOST_EXPERIMENT_PLAN.md`.
+no learned representation for). Full background: `plans/GHOST_BACKGROUND_FOR_CLAUDE_CODE.md`.
+Full pipeline/results spec: `plans/GHOST_EXPERIMENT_PLAN.md`.
+
+## Repo layout
+
+Git-initialized 2026-08-14 (`master`, root commit `123e375`). Planning
+docs live in `plans/` (`GHOST_BACKGROUND_FOR_CLAUDE_CODE.md`,
+`GHOST_EXPERIMENT_PLAN.md`, `GHOST_AGENT_TASKS.md`, `GHOST_self_improving.md`,
+`TRACK_A_SPEC.md`, `GHOST_AGENT_PAPER_DRAFT.md`), shell entry points in
+`bash_script/` (`submit_all.sh`), all Python in `src/` (including
+`track_a_prompts.py`, moved from repo root — it's a plain sibling import
+of `track_a_generate.py`, no path hack needed). `.gitignore` excludes
+`data/raw/`, `data/encoded/`, `data/track_a/`, `results/raw/`,
+`results/tables/`, `results/experience_log.jsonl`,
+`results/strategy_memory.json`, `logs/`, `.checkpoint.*.json`, `.claude/`,
+`venv/` — all generated/runtime state, never commit these.
 
 ## Threat model
 
@@ -588,3 +602,58 @@ reported as a document count.
   deterministic run-to-run like every other model in this repo. Also note:
   `_call_openai` sends `max_completion_tokens`, not `max_tokens` —
   `gpt-5.6-sol` rejects the latter too.
+
+## Track A dataset generation (`plans/TRACK_A_SPEC.md`) — IN PROGRESS as of 2026-08-14
+
+`src/track_a_generate.py` generates synthetic documents (DeepSeek-R1-Distill-
+Qwen-14B, local GPU inference) for Phase 2 full (250 docs/domain, 1000 total)
+into `data/track_a/full/` (`documents.jsonl`, `fields.jsonl`,
+`generation_log.jsonl`, `.checkpoint.full.json`). Checkpointed per-instance
+(atomic write-then-rename), so a kill only ever loses the one in-flight
+instance, never more.
+
+**Bug found and fixed (2026-08-14):** `process_instance` trusted the model's
+self-reported `field_type` over the schema. For `company_type`
+(`field_type: "category_code"`, description *"e.g. 'PTY LTD' or 'PUB CO'"*),
+the model echoed the example VALUE `'PTY LTD'` back as the `field_type`
+string itself, and `validate_field`'s strict dict lookup raised
+`KeyError: 'PTY LTD'` — deterministically, on every resubmit, since
+generation is seeded per `doc_id`. This is what silently ate the
+`slurm/track_a_full.sh` auto-resubmit chain's `MAX_RESUBMITS=12` budget on
+2026-08-13 with zero progress past instance 32 (`regfiling_0031`) — the
+chain's own final log line correctly pointed at a stuck instance, not a
+transient timeout. Fixed (commit `6ed54b8`): `field_type` is now always
+`DOMAIN_FIELDS[domain][field_name]["field_type"]` — `field_name` is already
+validated against `DOMAIN_FIELDS` at that point, so the schema is
+authoritative and the model's echo is never trusted. Verified fixed live:
+resumed from checkpoint (31 done), instance 32 that previously crashed now
+clears normally.
+
+**Running status:** after the fix, generation was restarted interactively
+against a free A100 (not via `sbatch`, to start immediately) and ran to
+158/1000 before being handed off — the interactive allocation (job
+`29188267`) had only a 4h limit with no auto-resubmit logic, unlike
+`slurm/track_a_full.sh`. At ~14:11 on 2026-08-14, the interactive process
+(PID 210101) was stopped cleanly (SIGTERM, checkpoint intact at 158) and
+`sbatch slurm/track_a_full.sh` was submitted as job `29192502` to take over
+— that script's own SIGUSR1-trap + resubmit chain (`MAX_RESUBMITS=12`) means
+it should now carry itself across future time-limit boundaries without
+manual intervention, unless it hits a genuine bug again.
+
+**Observed rate:** ~1.7 min/instance in practice (slower than the ~1 min/
+instance pilot estimate) — full 1000-instance run is closer to ~28h than the
+originally estimated 16-17h.
+
+**To check status in a fresh session:** `squeue -u $USER` for the current
+job in the `track_a_full` chain; `python3 -c "import json; print(len(json.load(open('data/track_a/full/.checkpoint.full.json'))['completed_doc_ids']))"`
+for instances completed; `tail logs/track_a_full_<latest_jobid>.log` for
+recent activity; grep `generation_log.jsonl` for `format_invalid`,
+`field_name_mismatch`, `literal_example_copy_unresolved`,
+`collision_review` flags — none of these have been triaged yet.
+
+**Do not publish to HuggingFace yet** — wait until the full 1000-instance
+run completes AND the validator-flagged instances above are reviewed. Also
+worth deciding at that point whether to bundle the release with the encoded
+GHOST conditions (`src/encode.py` output) rather than shipping raw/clean
+documents alone, since the paper's actual experiments run on the encoded
+versions, not the raw generation.
