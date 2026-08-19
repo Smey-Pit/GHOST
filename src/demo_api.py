@@ -58,6 +58,7 @@ class EncodeRequest(BaseModel):
     text: str
     field_value: str
     mechanism: str
+    vs_depth: int | None = None  # only used by ghost_permute_sentence_cpu
 
 
 class QueryRequest(BaseModel):
@@ -73,6 +74,7 @@ class RunRequest(BaseModel):
     mechanism: str
     query: str
     model_key: str
+    vs_depth: int | None = None  # only used by ghost_permute_sentence_cpu
 
 
 def _model_config(model_key):
@@ -132,12 +134,14 @@ def encode(req: EncodeRequest):
         raise HTTPException(400, "field_value must appear verbatim in text")
     proxy = get_proxy(_CONFIG) if MECHANISMS[req.mechanism][0] else None
     try:
-        return encode_text(req.text, req.field_value, req.mechanism, _CONFIG, proxy)
+        return encode_text(req.text, req.field_value, req.mechanism, _CONFIG, proxy, req.vs_depth)
     except RuntimeError as e:
         # find_target_permutation exhausted its trial budget -- a real,
         # documented failure mode (see encode.py's identical guard), not
         # a bug -- surface it as a client-visible error instead of a 500.
         raise HTTPException(422, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
 
 @app.post("/api/query")
@@ -161,9 +165,11 @@ def run(req: RunRequest):
 
     proxy = get_proxy(_CONFIG) if MECHANISMS[req.mechanism][0] else None
     try:
-        encoded = encode_text(req.text, req.field_value, req.mechanism, _CONFIG, proxy)
+        encoded = encode_text(req.text, req.field_value, req.mechanism, _CONFIG, proxy, req.vs_depth)
     except RuntimeError as e:
         raise HTTPException(422, str(e))
+    except ValueError as e:
+        raise HTTPException(400, str(e))
 
     clean_response = _run_query(req.text, req.query, req.model_key)
     encoded_response = _run_query(encoded["encoded_text"], req.query, req.model_key)

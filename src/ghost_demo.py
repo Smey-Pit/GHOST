@@ -28,21 +28,34 @@ sys.path.insert(0, os.path.dirname(__file__))
 from encode import (  # noqa: E402
     encode_bidi_only, encode_bidi_permute, encode_bidi_permute_sentence,
     encode_vs_only, encode_ghost, encode_ghost_permute,
-    encode_ghost_permute_sentence, load_proxy_model,
+    encode_ghost_permute_sentence, load_proxy_model, _derive_int_seed,
 )
+from bidi_permute import (  # noqa: E402
+    decompose, encode as bidi_permute_encode, find_target_permutation,
+)
+from sentence_utils import find_field_sentence  # noqa: E402
+from unicode_utils import derive_payload_bytes, byte_to_vs  # noqa: E402
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DEFAULT_CONFIG_PATH = os.path.join(_REPO_ROOT, "config.yaml")
 
+# Default fixed VS-injection depth (bytes -> VS chars appended per character)
+# for the CPU-only mechanism below. encode_char_with_vs_logprob's proxy-guided
+# path caps at max_iters=64 as a safety bound; this mirrors that order of
+# magnitude for a "maxed out" fixed-depth stand-in, since there's no logprob
+# signal here to decide when to stop.
+DEFAULT_CPU_VS_DEPTH = 48
+
 # mechanism key -> (needs_proxy, scope, label)
 MECHANISMS = {
-    "bidi_only":              (False, "field",    "Bidi reversal only"),
-    "bidi_permute":            (False, "field",    "Bidi separable permutation"),
-    "bidi_permute_sentence":    (False, "sentence", "Bidi permutation (whole sentence)"),
-    "vs_only":                  (True,  "field",    "Variation-selector injection only"),
-    "ghost":                    (True,  "field",    "GHOST (bidi reversal + VS injection)"),
-    "ghost_permute":            (True,  "field",    "GHOST-permute (bidi permutation + VS injection)"),
-    "ghost_permute_sentence":   (True,  "sentence", "GHOST-permute, whole sentence"),
+    "bidi_only":                  (False, "field",    "Bidi reversal only"),
+    "bidi_permute":               (False, "field",    "Bidi separable permutation"),
+    "bidi_permute_sentence":      (False, "sentence", "Bidi permutation (whole sentence)"),
+    "vs_only":                    (True,  "field",    "Variation-selector injection only"),
+    "ghost":                      (True,  "field",    "GHOST (bidi reversal + VS injection)"),
+    "ghost_permute":              (True,  "field",    "GHOST-permute (bidi permutation + VS injection)"),
+    "ghost_permute_sentence":     (True,  "sentence", "GHOST-permute, whole sentence"),
+    "ghost_permute_sentence_cpu": (False, "sentence", "GHOST-permute, whole sentence (max Hamming + fixed-depth VS, no GPU/proxy needed)"),
 }
 
 
@@ -76,7 +89,54 @@ def get_proxy(config, cache={}):
     return cache["proxy"]
 
 
-def encode_text(text, field_value, mechanism, config=None, proxy=None):
+def _encode_sentence_ghost_permute_fixed_vs(text, field_value, doc_id, seed, salt, trials, vs_depth):
+    """
+    CPU-only sentence-scope mechanism: same max-Hamming separable-
+    permutation search as encode_ghost_permute_sentence, but VS injection
+    is FIXED-DEPTH (vs_depth VS chars per character, keyed the same way
+    as the proxy-guided path) instead of logprob-adaptive -- no Qwen
+    proxy / GPU required. This is the mechanism used when a demo backend
+    is deployed somewhere without GPU access (see CLAUDE.md's demo-site
+    hosting discussion).
+
+    Mirrors encode_ghost_permute_sentence's injection order exactly: VS
+    bytes are derived and appended per character keyed on its ORIGINAL
+    position (orig_pos), iterated in permutation (stored) order -- not
+    the proxy-guided function's per-iteration logprob check, since there
+    is no model here to query.
+
+    Returns (encoded_full_text, hamming_distance).
+    """
+    located = find_field_sentence(text, field_value)
+    if located is None:
+        raise ValueError(f"could not locate a sentence containing {field_value!r} in text")
+    sentence_text, _start, _end = located
+
+    sentence_seed = _derive_int_seed(
+        seed, salt, "ghost_permute_sentence_cpu", doc_id, sentence_text,
+    )
+    dist, perm = find_target_permutation(sentence_text, trials=trials, seed=sentence_seed)
+    if perm is None:
+        raise RuntimeError(
+            f"find_target_permutation found no round-tripping permutation "
+            f"for sentence={sentence_text!r} within {trials} trials"
+        )
+    tree = decompose(tuple(perm))
+    chars_by_original_pos = [None] * len(sentence_text)
+    for orig_pos in perm:
+        payload_bytes = derive_payload_bytes(
+            seed, salt, "ghost_permute_sentence_cpu", doc_id, sentence_text,
+            orig_pos, n_bytes=vs_depth,
+        )
+        chars_by_original_pos[orig_pos] = (
+            sentence_text[orig_pos] + "".join(byte_to_vs(b) for b in payload_bytes)
+        )
+    encoded_sentence = bidi_permute_encode(tree, chars_by_original_pos)
+
+    return text.replace(sentence_text, encoded_sentence, 1), dist
+
+
+def encode_text(text, field_value, mechanism, config=None, proxy=None, vs_depth=None):
     """
     Run one GHOST encoding condition on arbitrary text.
 
@@ -106,23 +166,32 @@ def encode_text(text, field_value, mechanism, config=None, proxy=None):
     threshold_tau = config["threshold_tau"]
     trials = config.get("bidi_permute_search_trials", 500)
 
-    item = _wrap_as_item(text, field_value)
     stats = []
+    hamming_distance = None
 
-    if mechanism == "bidi_only":
-        out = encode_bidi_only(item)
-    elif mechanism == "bidi_permute":
-        out = encode_bidi_permute(item, trials, seed, salt)
-    elif mechanism == "bidi_permute_sentence":
-        out = encode_bidi_permute_sentence(item, trials, seed, salt)
-    elif mechanism == "vs_only":
-        out = encode_vs_only(item, proxy, seed, salt, threshold_tau, stats)
-    elif mechanism == "ghost":
-        out = encode_ghost(item, proxy, seed, salt, threshold_tau, stats)
-    elif mechanism == "ghost_permute":
-        out = encode_ghost_permute(item, proxy, seed, salt, threshold_tau, stats, trials)
-    elif mechanism == "ghost_permute_sentence":
-        out = encode_ghost_permute_sentence(item, proxy, seed, salt, threshold_tau, stats, trials)
+    if mechanism == "ghost_permute_sentence_cpu":
+        doc_id = _doc_id(text, field_value)
+        depth = vs_depth or DEFAULT_CPU_VS_DEPTH
+        encoded_text, hamming_distance = _encode_sentence_ghost_permute_fixed_vs(
+            text, field_value, doc_id, seed, salt, trials, depth,
+        )
+    else:
+        item = _wrap_as_item(text, field_value)
+        if mechanism == "bidi_only":
+            out = encode_bidi_only(item)
+        elif mechanism == "bidi_permute":
+            out = encode_bidi_permute(item, trials, seed, salt)
+        elif mechanism == "bidi_permute_sentence":
+            out = encode_bidi_permute_sentence(item, trials, seed, salt)
+        elif mechanism == "vs_only":
+            out = encode_vs_only(item, proxy, seed, salt, threshold_tau, stats)
+        elif mechanism == "ghost":
+            out = encode_ghost(item, proxy, seed, salt, threshold_tau, stats)
+        elif mechanism == "ghost_permute":
+            out = encode_ghost_permute(item, proxy, seed, salt, threshold_tau, stats, trials)
+        elif mechanism == "ghost_permute_sentence":
+            out = encode_ghost_permute_sentence(item, proxy, seed, salt, threshold_tau, stats, trials)
+        encoded_text = out["text"]
 
     return {
         "mechanism": mechanism,
@@ -130,9 +199,10 @@ def encode_text(text, field_value, mechanism, config=None, proxy=None):
         "needs_proxy": needs_proxy,
         "scope": scope,
         "original_text": text,
-        "encoded_text": out["text"],
+        "encoded_text": encoded_text,
         "field_value": field_value,
         "vs_injection_iterations": stats or None,
+        "hamming_distance": hamming_distance,
     }
 
 
