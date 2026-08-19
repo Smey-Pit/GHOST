@@ -237,6 +237,18 @@ def verify_char_span(document_text: str, value: str, char_span):
 
     Returns dict with keys: status ("ok" | "realigned" | "unresolved"),
     char_span (corrected span, or the original if unresolved).
+
+    Two fallback passes run only after an exact substring search fails,
+    both found necessary against real Track A output (not hypothetical):
+    the model sometimes writes a field's reported `value` with different
+    case/spacing/dashes than how it actually appears in the prose (e.g.
+    'PVT LTD' reported vs. 'Pvt Ltd' in text), or regroups a numeric
+    value differently (e.g. '123 456 789 012' reported vs. '123 45 678
+    9012' in text) -- same digits, different grouping. Both are still
+    genuinely present in the document, just not via a byte-exact match.
+    A value that survives neither pass is a genuine paraphrase (e.g.
+    'QLD-10' reported but the text only says 'Queensland') and stays
+    unresolved -- not recoverable by any string-matching fallback.
     """
     if (
         isinstance(char_span, (list, tuple)) and len(char_span) == 2
@@ -249,6 +261,20 @@ def verify_char_span(document_text: str, value: str, char_span):
     if len(occurrences) >= 1:
         start = occurrences[0]
         return {"status": "realigned", "char_span": [start, start + len(value)]}
+
+    flex_pattern = "".join(
+        r"[\s\-]*" if ch in " -" else re.escape(ch) for ch in value
+    )
+    match = re.search(flex_pattern, document_text, re.IGNORECASE)
+    if match:
+        return {"status": "realigned", "char_span": [match.start(), match.end()]}
+
+    digits = re.sub(r"\D", "", value)
+    if digits:
+        digit_pattern = r"\D*".join(re.escape(d) for d in digits)
+        match = re.search(digit_pattern, document_text)
+        if match:
+            return {"status": "realigned", "char_span": [match.start(), match.end()]}
 
     return {"status": "unresolved", "char_span": list(char_span) if char_span else None}
 
@@ -326,15 +352,6 @@ def process_instance(tokenizer, model, domain: str, doc_index: int,
             f"field_name_mismatch: requested={field_names} reported={reported_names}"
         )
 
-    document_record = {
-        "doc_id": doc_id,
-        "domain": domain,
-        "split": None,  # assigned later (90/10 split is a Phase 2 step)
-        "field_count": len(field_names),
-        "carrier_text": document_text,
-        "style": style,
-    }
-
     field_records = []
     for i, field_name in enumerate(field_names, start=1):
         matches = [f for f in fields_reported if f.get("field_name") == field_name]
@@ -385,6 +402,20 @@ def process_instance(tokenizer, model, domain: str, doc_index: int,
             "format_valid": format_valid,
             "collision_flagged": collision["flagged_for_review"],
         })
+
+    # field_count reflects the field_records actually produced, not the
+    # requested field_names -- a field can be silently dropped above
+    # (field_missing_in_output / field_value_missing) when the model's
+    # self-reported field_name doesn't match what was requested, and a
+    # count taken from the request would then disagree with fields.jsonl.
+    document_record = {
+        "doc_id": doc_id,
+        "domain": domain,
+        "split": None,  # assigned later (90/10 split is a Phase 2 step)
+        "field_count": len(field_records),
+        "carrier_text": document_text,
+        "style": style,
+    }
 
     # Memorization check (Step 1.5) -- implemented now so it runs
     # automatically in Phase 2; not meaningful at N=5/domain.

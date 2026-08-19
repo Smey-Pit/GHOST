@@ -88,6 +88,7 @@ def run_convergence_analysis(
     start_index: int = 0,
     use_memory: bool = True,
     agent_backbone_name: str = None,
+    use_proxy: bool = False,
     run_ghost_agent_fn: Callable = run_ghost_agent,
 ) -> list:
     """
@@ -129,6 +130,15 @@ def run_convergence_analysis(
             (not per-field) -- for a local backbone this is the difference
             between loading weights once vs. hundreds of times; see
             agent_backbone.LocalReActBackbone's docstring.
+        use_proxy: load the Qwen2.5-7B-Instruct proxy ONCE (mirrors the
+            backbone's load-once-reuse pattern) and pass it into every
+            run_ghost_agent_fn call via `proxy=`. Without this, the
+            agent's bidi_permute tool still works (no proxy needed) but
+            combine_permute/encode_vs_logprob silently error out via
+            their normal ERROR-tool-result fallback, so the batch never
+            actually exercises the real logprob-guided VS mechanism --
+            only the older fixed-length tool_encode_vs/combine. Needs a
+            GPU. False by default so tests/no-GPU callers are unaffected.
         run_ghost_agent_fn: defaults to ghost_agent.run_ghost_agent --
             overridable for tests so this can run without a GPU or a
             real Anthropic API key
@@ -156,6 +166,12 @@ def run_convergence_analysis(
         backbone = resolve_backbone(agent_backbone_name, config)
     backbone_label = agent_backbone_name or config["agent_backbones"]["default"]
 
+    proxy = None
+    if use_proxy:
+        from encode import load_proxy_model
+        print("Loading Qwen2.5-7B-Instruct proxy (GPU)...")
+        proxy = load_proxy_model(config)
+
     try:
         for i, doc in enumerate(sampled):
             global_doc_index = start_index + i
@@ -180,6 +196,7 @@ def run_convergence_analysis(
                     backbone=backbone,
                     doc_index=global_doc_index,
                     use_memory=use_memory,
+                    proxy=proxy,
                 )
 
                 row = {
@@ -230,6 +247,10 @@ def run_convergence_analysis(
         # no-op for that backbone anyway, but keeps ownership clear).
         if backbone is not None:
             backbone.close()
+        if proxy is not None:
+            import torch
+            del proxy
+            torch.cuda.empty_cache()
 
     out_path = os.path.join(output_dir, "agent_convergence.csv")
     if results:
@@ -317,6 +338,15 @@ if __name__ == "__main__":
             "pre-ablation default (claude-sonnet-4-6)."
         ),
     )
+    parser.add_argument(
+        "--use_proxy", action="store_true",
+        help=(
+            "Load the Qwen2.5-7B-Instruct proxy once and pass it to "
+            "every field so the agent's combine_permute/encode_vs_logprob "
+            "tools work (real logprob-guided VS), not just bidi_permute's "
+            "seed-diversified search. Needs a GPU."
+        ),
+    )
     args = parser.parse_args()
 
     run_convergence_analysis(
@@ -329,4 +359,5 @@ if __name__ == "__main__":
         start_index=args.start_index,
         use_memory=not args.no_memory,
         agent_backbone_name=args.agent_backbone,
+        use_proxy=args.use_proxy,
     )

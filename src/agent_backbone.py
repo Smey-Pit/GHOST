@@ -207,7 +207,191 @@ TOOL_DEFINITIONS = [
             "required": ["text", "bidi_config", "vs_payload"],
         },
     },
+    {
+        "name": "bidi_permute",
+        "description": (
+            "Search for a separable permutation of text maximally "
+            "displaced (by Hamming distance) from the original, subject "
+            "to round-trip correctness -- strictly stronger than "
+            "manually guessing an encode_bidi config, since this tries "
+            "many random candidates and keeps the best one that still "
+            "renders back to the original. No proxy model needed; "
+            "always available."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Text to permute (field value or whole sentence)",
+                },
+                "trials": {
+                    "type": "integer",
+                    "description": "Number of random candidate permutations to try (default 2000)",
+                },
+                "seed": {
+                    "type": "integer",
+                    "description": (
+                        "Random seed for the search (default 0). `trials` only "
+                        "samples a fraction of the full permutation space, so "
+                        "if the Hamming distance you get back is disappointing, "
+                        "call this again with a DIFFERENT seed rather than "
+                        "assuming it's the best available result."
+                    ),
+                },
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "name": "encode_vs_logprob",
+        "description": (
+            "Inject Variation Selector characters with each character's "
+            "depth chosen ADAPTIVELY by querying a real proxy model's "
+            "logprob after each VS byte, stopping once it drops below "
+            "threshold_tau. Only available if a proxy model has been "
+            "loaded for this run -- if you get an ERROR result calling "
+            "this, fall back to encode_vs/combine instead."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Text to inject VS into",
+                },
+                "payload": {
+                    "type": "string",
+                    "description": "Seeds the per-character derived byte stream (does not control depth -- that's adaptive)",
+                },
+                "threshold_tau": {
+                    "type": "number",
+                    "description": "Stop injecting once logprob drops to/below this (more negative = harder, more VS needed). Try -8.0 first.",
+                },
+            },
+            "required": ["text", "payload", "threshold_tau"],
+        },
+    },
+    {
+        "name": "combine_permute",
+        "description": (
+            "Apply BOTH the searched separable-permutation bidi "
+            "mechanism AND real logprob-guided VS injection in one "
+            "call -- the strongest available combination. Prefer this "
+            "over `combine` whenever it's available (i.e. doesn't "
+            "return an ERROR result) -- if it errors, a proxy model "
+            "wasn't loaded for this run; fall back to `combine`."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Text to encode",
+                },
+                "trials": {
+                    "type": "integer",
+                    "description": "Number of random candidate permutations to try (default 2000)",
+                },
+                "payload": {
+                    "type": "string",
+                    "description": "Seeds the per-character derived VS byte streams",
+                },
+                "threshold_tau": {
+                    "type": "number",
+                    "description": "Logprob stopping threshold -- try -8.0 first",
+                },
+                "seed": {
+                    "type": "integer",
+                    "description": (
+                        "Random seed for the permutation search (default 0) -- "
+                        "call again with a DIFFERENT seed if the Hamming "
+                        "distance this returns is disappointing for the trial "
+                        "budget used."
+                    ),
+                },
+            },
+            "required": ["text", "trials", "payload", "threshold_tau"],
+        },
+    },
+    {
+        "name": "widen_scope",
+        "description": (
+            "Request a WIDER piece of text to obfuscate (e.g. the full "
+            "sentence containing your current field) when your best "
+            "attempt on the current target still can't reach full "
+            "consensus against the panel. Only use this AFTER at least "
+            "one combine_permute/combine attempt, including a seed "
+            "retry, has already failed -- it is not a free first move. "
+            "Only available if the caller supplied wider context for "
+            "this run; returns an ERROR result otherwise, in which case "
+            "keep working with the current target. If you get real "
+            "wider text back, build your NEXT attempt by calling "
+            "combine_permute/combine on THAT text, not your original "
+            "target."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    },
 ]
+
+
+def extract_config_from_tool_calls(tool_calls: list) -> tuple:
+    """
+    Recover the real bidi_config/vs_payload the agent actually used from
+    the tool calls it executed during a turn, instead of the
+    "from_agent" placeholder ghost_agent.py's Attempt records used to
+    store -- the agent only ever reports one already-combined
+    <final_encoding> string, so the structured parameters only exist in
+    the tool_use blocks that produced it.
+
+    tool_calls: list of (name, input_dict) in call order, e.g.
+        backbone.last_tool_calls after backbone.run_turn().
+
+    Prefers the LAST `combine`/`combine_permute` call (the one-shot
+    bidi+VS tools) since that's the call whose output is most likely
+    what got reported. Falls back to the last standalone
+    `encode_bidi`/`bidi_permute` and `encode_vs`/`encode_vs_logprob`
+    calls (bidi_config and vs_payload tracked independently, since the
+    agent may have called them separately rather than via a combine
+    tool). Returns ("unknown", "unknown") if none was ever called --
+    e.g. the agent reasoned to a final answer without any tool call
+    this turn.
+
+    `bidi_permute`/`combine_permute` have no literal "config" string
+    (the permutation is searched, not manually specified) -- recorded
+    as f"bidi_permute(trials={trials})" so reflection can still show
+    THAT a searched permutation was used and at what trial budget, even
+    though the specific permutation itself isn't a short string worth
+    printing.
+    """
+    bidi_config = "unknown"
+    vs_payload = "unknown"
+
+    for name, tool_input in tool_calls:
+        if name == "combine":
+            bidi_config = tool_input.get("bidi_config", bidi_config)
+            vs_payload = tool_input.get("vs_payload", vs_payload)
+        elif name == "encode_bidi":
+            bidi_config = tool_input.get("config", bidi_config)
+        elif name == "encode_vs":
+            vs_payload = tool_input.get("payload", vs_payload)
+        elif name == "combine_permute":
+            trials = tool_input.get("trials", "?")
+            seed = tool_input.get("seed", 0)
+            bidi_config = f"bidi_permute(trials={trials},seed={seed})"
+            vs_payload = tool_input.get("payload", vs_payload)
+        elif name == "bidi_permute":
+            trials = tool_input.get("trials", "?")
+            seed = tool_input.get("seed", 0)
+            bidi_config = f"bidi_permute(trials={trials},seed={seed})"
+        elif name == "encode_vs_logprob":
+            vs_payload = tool_input.get("payload", vs_payload)
+
+    return bidi_config, vs_payload
 
 
 def execute_tool_call(tool_name: str, tool_input: dict) -> str:
@@ -227,6 +411,7 @@ def execute_tool_call(tool_name: str, tool_input: dict) -> str:
 def run_agent_turn(
     client, messages: list, system_prompt: str, max_tool_rounds: int = 8,
     response_max_tokens: int = 2000, model_id: str = DEFAULT_ANTHROPIC_MODEL,
+    tool_call_log: Optional[list] = None,
 ) -> tuple:
     """
     Run one agent turn against a real (or fake, for tests) Anthropic-SDK-
@@ -249,6 +434,15 @@ def run_agent_turn(
     call (confirmed against the real API). Looping until no tool_use
     blocks remain (capped by max_tool_rounds) fixes this.
 
+    tool_call_log, if given, is appended with (name, input) for every
+    tool_use block actually executed, in call order -- this is how a
+    caller (ghost_agent.py) recovers the REAL bidi_config/vs_payload the
+    agent used, instead of the "from_agent" placeholder Attempt records
+    used to store (see extract_config_from_tool_calls below): the agent
+    reports one already-combined <final_encoding> string, so the only
+    place the actual structured parameters exist is the tool_use blocks
+    exchanged during this turn.
+
     Returns:
         (updated_messages, agent_final_text)
     """
@@ -270,6 +464,8 @@ def run_agent_turn(
                 final_text = block.text
             elif block.type == "tool_use":
                 result = execute_tool_call(block.name, block.input)
+                if tool_call_log is not None:
+                    tool_call_log.append((block.name, block.input))
                 tool_results.append({
                     "type": "tool_result",
                     "tool_use_id": block.id,
@@ -299,21 +495,25 @@ class AnthropicBackbone:
             client = anthropic.Anthropic()
         self.client = client
         self.messages = []
+        self.last_tool_calls = []
 
     def reset(self) -> None:
         """Clear conversation state between fields. No GPU weights to keep warm."""
         self.messages = []
+        self.last_tool_calls = []
 
     def run_turn(
         self, user_msg: str, system_prompt: str,
         tool_budget_per_iter: int, response_max_tokens: int,
     ) -> str:
+        self.last_tool_calls = []
         self.messages.append({"role": "user", "content": user_msg})
         self.messages, final_text = run_agent_turn(
             self.client, self.messages, system_prompt,
             max_tool_rounds=tool_budget_per_iter,
             response_max_tokens=response_max_tokens,
             model_id=self.model_id,
+            tool_call_log=self.last_tool_calls,
         )
         return final_text
 
@@ -523,9 +723,11 @@ class LocalReActBackbone:
         self.max_new_tokens = max_new_tokens
         self.strip_think = strip_think
         self.messages: list = []
+        self.last_tool_calls = []
 
     def reset(self) -> None:
         self.messages = []
+        self.last_tool_calls = []
 
     def release_gpu(self) -> None:
         """Move backbone weights to CPU so the search-tier ensemble has
@@ -590,6 +792,7 @@ class LocalReActBackbone:
         # for a budget reason, not a capability reason.
         effective_max_tokens = max(response_max_tokens, self.max_new_tokens)
 
+        self.last_tool_calls = []
         final_text = ""
         for _ in range(tool_budget_per_iter):
             text = self._generate(self.messages, max_new_tokens=effective_max_tokens)
@@ -600,6 +803,7 @@ class LocalReActBackbone:
             if not calls:
                 break
 
+            self.last_tool_calls.extend(calls)
             results = [
                 f"Tool `{name}` result: {execute_tool_call(name, tool_input)}"
                 for name, tool_input in calls

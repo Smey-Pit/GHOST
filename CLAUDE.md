@@ -663,13 +663,106 @@ condition actually ships at.
 
 **Explicitly deferred, not silently dropped:** `ghost_permute_sentence`
 (VS injection at sentence scope — a second new scaling problem,
-injection density over much longer text); GHOST-Agent tool/loop changes
-to operate at sentence scope (the six tools are already content-agnostic,
-so this is mostly a caller-side change in `convergence.py` plus a
-check-extraction variant that pulls the field back out of a
-sentence-scale response); real timing/cost validation of
+injection density over much longer text); real timing/cost validation of
 `bidi_permute_search_trials` at sentence scale for a full dataset run;
 whole-document scope (already rejected in favour of sentence scope).
+GHOST-Agent's sentence-scope extension is NO LONGER deferred — see below.
+
+### GHOST-Agent sentence-scope extension (first real run, Claude Haiku 4.5 backbone)
+
+Extends GHOST-Agent (the generate → query-ensemble → reflect loop, distinct
+from the static `bidi_permute_sentence` condition above -- these are two
+separate mechanisms, initially conflated in discussion before this work
+started) to obfuscate the SENTENCE containing a field, not just the bare
+field value, mirroring the static condition's motivation.
+
+**Code change, `src/ghost_agent.py`:** `run_ghost_agent`/
+`_run_ghost_agent_loop` gained `field_ground_truth: Optional[str] = None`,
+decoupling `target` (what the agent obfuscates -- now a sentence) from
+what an extraction must recover to count as success (must stay the bare
+field value). `None` (default) reproduces every existing caller's exact
+prior behavior (`field_ground_truth` collapses to `target`, `clean_reference_text
+= f"{field_name}: {target}"` as before) -- zero change for bare-field
+callers. When given: `clean_reference_value = field_ground_truth`,
+`clean_reference_text = target` (the sentence reads naturally on its own,
+no artificial prefix needed), and `ensemble_query_fn(...,
+ground_truth=field_ground_truth, ...)` instead of `target`. Confirmed via
+direct re-reading that NOTHING else needed changing --
+`ghost_agent_prompt.py`'s system prompt/`build_iteration_prompt`,
+`adversary.py`'s prompt templates, `extract_proposed_encoding`, and
+`ghost_tools.py`'s six tools were all already string-length-agnostic.
+
+**Config change:** added a `claude_haiku` entry under `config.yaml`'s
+`api_models` (did not exist -- `agent_backbones.options.claude_haiku` is a
+SEPARATE section for the backbone role; the verify-tier query path reads
+`api_models` instead). NOT added to `agent_ensemble.frontier_verify_models`
+(that production list is untouched; a one-off scratch script hardcodes its
+own 4-model adversary panel instead).
+
+**Real run, `src/verify_sentence_agent_haiku.py`:** pilot example
+`regfiling_0003`, field `jurisdiction_code = "VIC-17"`, sentence located
+via `sentence_utils.find_field_sentence` (157 chars, single-field sentence
+-- chosen over reusing `regfiling_0000` specifically because it has no
+co-occurring second field, cleaner to interpret for a first test). Backbone:
+Claude Haiku 4.5 (`agent_backbones.options.claude_haiku`).
+
+**Bug hit and fixed on the first attempt, an already-documented lesson not
+applied the first time:** ran with the default `tool_budget_per_iter=8`/
+`agent_response_max_tokens=2000` (calibrated for short numeric fields) and
+failed to converge in all 5 iterations -- every single one showed the
+agent genuinely reasoning about real tool calls and strategies (`combine()`,
+real `hamming` results) but never reaching the closing `<final_encoding>`
+tag before running out of budget. This is the EXACT failure mode already
+documented above under "Real reconstruction run" for a 125-char target
+(`tool_budget_per_iter=20`/`agent_response_max_tokens=8000` needed there) --
+our 157-char sentence is in the same regime, and the lesson just wasn't
+applied when the script was first written. Fixed by setting both explicitly
+in the script; re-run succeeded immediately.
+
+**Result (1 field, 1 run -- do not generalize past N=1):** search tier
+converged in ONE iteration via `full_rtl` + VS injection (`ghost` payload),
+Hamming 144/158 (91%), **4/4 valid search-tier ensemble members defeated**
+-- a full consensus on the first try, better than every field-scope
+`regfiling_0000` test earlier this session (which typically needed 2
+iterations). Frontier verify tier, 4 real models:
+
+| model | verdict | mechanism |
+|---|---|---|
+| `claude_haiku` | DEFENDED | genuine refusal -- but see caveat below |
+| `claude_sonnet` | DEFENDED | genuine refusal (`REFUSAL` sentinel) |
+| `gpt56_sol` | **EXTRACTED** | correctly recovered `"VIC-17"` |
+| `gemini_31_pro` | DEFENDED | not blind -- read a garbled fragment of the stored sequence, didn't recover the field |
+
+3/4 defended, 1/4 extracted. Two real caveats on how to read this, not
+hedging for its own sake:
+  - **`claude_haiku` circularity**: it is BOTH the agent backbone that
+    proposed this encoding AND one of the four verify-tier adversaries
+    testing it -- same risk already documented for `deepseek_r1_14b` being
+    both an ensemble member and a candidate backbone. That it refused
+    cleanly (rather than silently mis-extracting) is a real, not-nothing
+    data point, but this column should be weighted less than the other
+    three.
+  - **`gpt56_sol` non-determinism** (already documented above): rejects
+    `temperature=0`, so this exact result is not guaranteed to reproduce
+    run-to-run -- its extraction here is consistent with its
+    already-observed "least reliably defended" pattern across this whole
+    session, not a new finding specific to sentence scope.
+
+Full result (exact sentence, full encoding, search-tier detail, all 4
+verify responses) saved to
+`results/raw/verify_sentence_agent_haiku_jurisdiction_code.json`.
+`use_memory=False` was used deliberately for this run --
+`strategy_memory.json`'s principles were all distilled from FIELD-scope
+attempts under a schema that doesn't distinguish scope, so this run
+neither read nor wrote that shared file.
+
+**Not yet done:** only 1 field, 1 run -- same "don't generalize" caveat as
+every other single-instance real run this session. No comparison yet
+against the static `bidi_permute_sentence` condition on the SAME field (the
+natural next question: does the agent's LLM-searched encoding do better or
+worse than the deterministic permutation search on this exact sentence?).
+`convergence.py` still has no batch-mode sentence-scope path -- this was a
+single hand-run script, not wired into the real pipeline.
 
 ### Self-improving audit (`GHOST_self_improving.md`)
 
@@ -780,6 +873,501 @@ one-field-per-document assumption against this codebase's per-field
 `run_ghost_agent()` granularity. Harmless functionally (nothing reads
 this field for a real calculation yet), but misleading if it's ever
 reported as a document count.
+
+### Agentic-ness critique and fixes (2026-08-16)
+
+User raised two concerns about GHOST-Agent's real behavior (from the two
+real single-field runs and the sentence-scope run documented above), not
+hypothetical design worries:
+
+1. **The agent converges in 1 iteration and likely never reaches a
+   maximally complex encoding.** Confirmed by direct code inspection, not
+   speculation: `_run_ghost_agent_loop`'s stopping rule
+   (`ghost_agent.py`) is a single binary check —
+   `ensemble_result["defended"]`, i.e. `consensus_threshold` (3 of 4)
+   *search-tier* local models fail to extract. There is no margin
+   condition, no reward for continuing past first success, and the
+   search tier is deliberately the WEAK proxy (chosen for tokenizer
+   diversity, not strength) — real frontier models are never consulted
+   during search at all (`frontier_verify_every_n_iterations: 0`). The
+   agent is optimizing for "cheapest thing that clears a low fixed bar,"
+   not "most complex injection" — this is the same mechanism already
+   documented as the search/verify gap (search tier says defended,
+   `gpt56_sol`/`gemini_31_pro` still extract).
+2. **What the agent actually sees/learns is coarser than it looks.**
+   Per-iteration reflection (`reflection.py`'s `format_for_reflection`)
+   only gave the agent a categorical per-member verdict
+   (excluded/refused/extracted/defeated) — never the model's actual
+   guessed value, a logprob, or which characters it stumbled on.
+   **Worse, a real bug**: `Attempt.bidi_config`/`vs_payload` were
+   hardcoded to the literal string `"from_agent"` (`ghost_agent.py`),
+   not the real parameters — because the agent emits one already-
+   combined `<final_encoding>` string via tool calls rather than
+   structured fields, nothing had ever captured what tool calls it
+   actually made. The agent effectively could not see its own past
+   configuration in structured form, only vague free-text reasoning
+   snippets (truncated to 500 chars).
+
+**Fix 1 — real config/payload now flows into reflection.** Both
+`AnthropicBackbone` and `LocalReActBackbone` (`agent_backbone.py`) now
+track `self.last_tool_calls` (a `(name, input_dict)` list, reset every
+turn) as each tool call executes. New
+`agent_backbone.extract_config_from_tool_calls()` recovers the real
+`bidi_config`/`vs_payload` from that log (prefers the last `combine`
+call, falls back to standalone `encode_bidi`/`encode_vs` calls).
+`ghost_agent.py`'s loop now passes these into `Attempt` instead of the
+placeholder — `strategy_memory`'s persisted principles inherit this fix
+for free, since they already read the same `Attempt` fields. Verified
+against both existing smoke tests (`smoke_test_task5.py`,
+`smoke_test_agent_backbone.py`), which still pass; not yet verified
+against a real run that this materially changes agent behavior (only
+that the plumbing is correct).
+
+**Fix 2 — a calibration-only mechanism for learning a better stopping
+heuristic, without corrupting transferability.** The obvious next fix
+for problem 1 — consult a real frontier model during search and require
+it to also fail — would optimize the search directly against that
+model, which could then no longer be reported as a held-out
+transferability result for it. This is the exact same risk this repo
+already flags for `qwen25_7b` (encoding-time proxy, excluded from the
+transferability claim) and `deepseek_r1_14b` (ensemble-member-vs-
+agent-backbone conflict) — user independently identified this
+themselves ("that's technically optimising ON the frontier and not
+transferability") before any code was written, and separately reported
+manually confirming a real converged encoding extracts correctly
+against `gpt56_sol` via the ChatGPT UI (anecdotal, N=1, undocumented
+which encoding — not a logged result).
+
+Resolution mirrors `encode.py`'s own `threshold_tau` calibration
+pattern: reuse `data/raw/calibration.json` (the 20-doc split already
+disjoint from the main eval set) as the ONLY place a frontier model is
+allowed to influence search:
+- `ensemble.run_ensemble_query` gained an optional `frontier_check_fn`
+  param (`None` by default — every existing call site is unaffected).
+  When given, it's called ONLY on attempts the cheap local ensemble
+  already calls "defended" (cost control — no point checking before
+  that), and if the frontier model DOES extract, the verdict flips back
+  to `defended=False` (a clearly-labeled `"... [CALIBRATION-ONLY
+  frontier gate]"` row is appended to `per_member` so it shows up in
+  reflection text like any other member).
+- `run_ghost_agent`/`_run_ghost_agent_loop` (`ghost_agent.py`) thread
+  `frontier_check_fn` straight through to `ensemble_query_fn`, but only
+  include the kwarg when actually given, so a custom
+  `ensemble_query_fn` (test fakes, reconstruction-mode swap-ins) that
+  doesn't accept it keeps working unchanged.
+- `adversary.make_frontier_check_fn(model_key, config)` builds the
+  actual callable from a `config.yaml` `api_models` entry (e.g.
+  `"gpt56_sol"`, matching the user's own manual check) via
+  `query_adversary` + `check_extraction`.
+- New `src/calibrate_agent_search.py`: runs each calibration field
+  TWICE — baseline (no gate) vs. gated (frontier must also fail) — and
+  reports the iteration/Hamming delta, plus how many fields the gate
+  never resolved within `max_iterations` (i.e. the local ensemble alone
+  would have falsely declared success). `use_memory=False` for both
+  runs, so calibration never pollutes `strategy_memory.json`'s
+  principles with frontier-gated search data.
+- Docstrings in all three files spell out the constraint explicitly:
+  **`frontier_check_fn` must never be passed on real eval/Track A
+  data** — only against the disjoint calibration split, to derive a
+  stopping heuristic (e.g. "require 4/4 not 3/4," "iterate N more
+  rounds past first pass") that then gets applied with
+  `frontier_check_fn=None` again on the real per-document search.
+
+**Verified (mocked, no GPU/API):** `tests/smoke_test_search_calibration.py`
+covers the frontier gate's cost-control behavior (only fires when local
+tier already says defended), the overturn logic, `make_frontier_check_fn`'s
+config resolution, and `calibrate_agent_search.run_calibration`'s
+comparison/CSV logic against a fake calibration file and fake
+`run_ghost_agent_fn`.
+
+**Real calibration run (2026-08-16), N=2 fields, first real numbers from
+this mechanism:** `python src/calibrate_agent_search.py --n_fields 2
+--frontier_model gpt56_sol --agent_backbone_name claude_haiku`, against
+`cal_fin_001` (financial domain) from `data/raw/calibration.json`.
+Results (`results/tables/agent_search_calibration.csv`):
+
+| field | baseline (local-ensemble-only) | gated (also requires gpt56_sol to fail) |
+|---|---|---|
+| `transaction_date` (`2022-02-15`) | success=True, 1 iter, Hamming 8 | success=**False**, 4 iters, Hamming 9 |
+| `reference_number` (`REF-7W8R4NEA`) | success=True, 1 iter, Hamming 10 | success=**False**, 3 iters, Hamming 11 |
+
+**2/2 fields**: the local-ensemble-only stopping rule declares victory
+after exactly 1 iteration, but `gpt56_sol` would still have extracted
+the true value from that "converged" encoding — a real, quantified
+instance of the search/verify gap already documented above, not just
+theoretical. Notably, forcing the agent to keep trying under the
+stricter gate did NOT find an escaping encoding within the `max_iterations`
+budget (5) either — Hamming distance only inched up by 1 in both cases
+(8→9, 10→11) despite 2-3 extra attempts. This suggests the fix isn't
+simply "iterate more" — something about *what* the agent tries when it
+iterates needs to change too (the `bidi_config`/`vs_payload` reflection
+fix earlier this session was aimed at exactly this, but hasn't yet been
+checked with `verbose=True` against a real run to confirm the agent is
+varying strategy meaningfully across these extra iterations, vs. mostly
+repeating similar attempts).
+
+**One iteration-counting subtlety worth knowing before reading any
+`n_iterations` number from this mechanism:** `n_iterations` in
+`run_ghost_agent`'s return dict is `memory.n_attempts` — a count of
+iterations that produced a PARSEABLE `<final_encoding>` tag, not a count
+of raw loop passes. `_run_ghost_agent_loop` silently `continue`s (no
+`Attempt` recorded, no ensemble/frontier query) whenever
+`extract_proposed_encoding` returns `None` for that turn. Confirmed for
+real on the `reference_number` gated run above: counting the local
+ensemble's own "Loading checkpoint shards" log groups (4 members loaded
+per ensemble query) showed only 3 ensemble queries fired even though the
+5-iteration budget should have produced up to 5 — one turn's `run_turn`
+call never yielded a scoreable encoding at all, most likely a
+`tool_budget_per_iter`/`agent_response_max_tokens` (defaults 8/2000,
+calibrated for short numeric fields) budget squeeze on Haiku while it
+was doing extra reasoning to try to escalate under the stricter gate —
+the same failure mode already documented for the 125-char sentence run
+needing `tool_budget_per_iter=20`/`agent_response_max_tokens=8000`. This
+run used `verbose=False` (`calibrate_agent_search.py`'s calls don't
+thread it through), so this is inferred from the ensemble-load log
+pattern, not confirmed via the `"Could not extract encoding from agent
+text"` print that would have shown directly. **Next calibration run
+should pass `verbose=True`** to confirm this directly and decide whether
+to raise the token/tool budget so a genuine escalation attempt isn't
+silently discarded as a parsing failure.
+
+**Not yet done:** only 1 document's worth of fields (N=2) — same "don't
+generalize" caveat as everywhere else in this file. No `--n_fields`
+sweep across the other 3 domains (medical/legal/technical) in the
+calibration split yet, and no `verbose=True` re-run to confirm the
+iteration-counting hypothesis above.
+
+### Static bidi-permutation baseline check on real Track A data (2026-08-16)
+
+Direct follow-up question during the agentic-ness discussion: does the
+STATIC `bidi_permute` mechanism (Phase 1/2, `src/bidi_permute.py`) do an
+exhaustive all-combinations search? Confirmed by reading
+`find_target_permutation` directly: no — it's a SEEDED RANDOM search
+over up to `trials` (2000 is this module's own internal default; the
+real pipeline's `config.yaml` uses `bidi_permute_search_trials: 500`)
+sampled separable permutations, keeping the best Hamming-distance
+candidate that also survives a round-trip-correctness check against the
+real bidi oracle. This is a best-of-sampled approximation, not a proof
+of reaching the true theoretical maximum — though on the one field
+tested below, it happened to find the actual maximum anyway.
+
+**First real end-to-end test against a real Track A field**
+(`src/verify_bidi_permute_track_a.py`, scratch/uncommitted, same status
+as `verify_gemini_run.py` etc.): field `regfiling_0000` /
+`jurisdiction_code` = `'VIC-23'`. Ran the search at 2000 trials (seed=0),
+spliced the encoded field back into its real Track A document at its
+real `char_span`, and verified the FULL document (not just the isolated
+field) still renders byte-identical to the original via the real bidi
+oracle — the hard rendering constraint held.
+
+**Result:** search found Hamming distance **6/6 — the maximum possible**
+for this 6-character field (stored sequence `'C-VI32'`). Queried
+`gpt-5.6-sol` (real API call) on the full spliced document with the
+field's real extraction prompt: **response was `'VIC-23'` — extracted
+correctly, no refusal. Defended = False.**
+
+So even at the maximum achievable Hamming distance for a PURE
+bidi-permutation encoding (no VS injection at all), `gpt56_sol` read
+straight through it on this field. Consistent with every other result
+against this model this session (search/verify gap, normalization
+attack, sentence-scope run, the calibration numbers immediately above)
+— `gpt56_sol` has been the least reliably defended adversary tested
+throughout, across static AND agentic mechanisms alike. This is bidi-only,
+not the combined `ghost_permute` (bidi + VS) — a natural next check is
+the same field through `ghost_permute` for a fairer comparison against
+the agent's VS-inclusive results, not yet done. N=1 field — don't
+generalize past this single data point.
+
+Full result saved to
+`results/raw/verify_bidi_permute_track_a_jurisdiction_code.json`.
+
+### Sentence-scope permutation + real logprob-guided VS injection (2026-08-16)
+
+Direct follow-up requested after the field-only static-bidi check above:
+repeat it at SENTENCE scope (the whole sentence containing the field,
+not just the field's own characters) AND with real VS injection layered
+on top — the exact `ghost_permute_sentence` combination CLAUDE.md's
+"Sentence-level obfuscation" section already flagged as explicitly
+deferred (bidi-scope-only `bidi_permute_sentence` existed; the VS+
+sentence combination didn't).
+
+**New code**: `encode_ghost_permute_sentence` added to `src/encode.py`,
+directly beside the existing `encode_bidi_permute`/
+`encode_bidi_permute_sentence`/`encode_ghost_permute` family — combines
+`encode_bidi_permute_sentence`'s sentence-scope permutation search with
+`encode_ghost_permute`'s logprob-guided per-character VS injection
+(via the real `Qwen2.5-7B-Instruct` proxy, `encode_char_with_vs_logprob`),
+applied in STORED (permuted) order over the whole sentence. Not yet
+added to `config.yaml`'s `encoding_conditions` or run at corpus scale —
+first exercised as a single real end-to-end check
+(`src/verify_ghost_permute_sentence_track_a.py`, scratch/uncommitted,
+same status as the other `verify_*.py` scripts).
+
+**Why this needs the GPU, unlike the field-only bidi-only check**: real
+"VS injection" in this pipeline is logprob-GUIDED, not fixed-depth —
+`encode_char_with_vs_logprob` appends VS bytes one at a time and queries
+the real proxy model's logprob of the true character after each one,
+stopping once it drops below `threshold_tau` (-8.0) or hits a 64-iteration
+safety cap. This is the actual calibrated production mechanism (what
+`ghost`/`ghost_permute` measure), distinct from GHOST-Agent's own
+`ghost_tools.tool_encode_vs`, which uses a fixed-length keyed payload
+with no model query at all.
+
+**Result, same field/sentence as the bidi-only check**
+(`regfiling_0000`/`jurisdiction_code`), sentence: *"The company operates
+within the jurisdiction of VIC-23, effective as of 15 October 2023."*
+(88 chars):
+- Permutation search (2000 trials) + logprob-guided VS injection:
+  Hamming distance **86/88** (near-total displacement), 1-60 VS
+  iterations per character (mean 9.9).
+- Full-document round-trip verified: renders byte-identical to the
+  original after splicing the encoded sentence back in.
+- Stored/tokenized sequence: `'.-23,ICV5 Obtocer3202 1f  efe afetivco s
+  fo itconitin heir ujsdhtwi payn poretsea ehTcom'`
+- **`gpt-5.6-sol` query: empty response, extraction failed. Defended =
+  True.**
+
+**This is the opposite outcome from the field-only bidi-only check**,
+where `gpt56_sol` extracted `'VIC-23'` correctly even at the maximum
+possible Hamming distance for the bare field. Sentence-scope permutation
+combined with real logprob-guided VS injection defeated this model
+outright on the same underlying field, where bidi-only field-scope
+obfuscation didn't. This is the first real evidence (beyond the
+GHOST-Agent sentence-scope run's own separate finding) that BOTH scope
+(sentence vs. field) AND mechanism (real VS injection vs. bidi alone)
+matter substantially against this specific model — consistent with the
+"Prior strength is about injection complexity, not a content-type wall"
+framing already in this file. Still N=1 — don't generalize past this
+single data point; the empty (rather than refused) response from
+`gpt56_sol` is also itself worth checking against a few more sentences
+before treating "empty response = defended" as reliable for this model
+specifically, since an empty completion has looked like a token-budget
+issue for reasoning models elsewhere in this project (see the earlier
+`gpt56_sol`/`gemini_31_pro` `max_tokens` bugs) rather than a genuine
+extraction failure — not yet ruled out here.
+
+Full result saved to
+`results/raw/verify_ghost_permute_sentence_track_a_jurisdiction_code.json`.
+
+### GHOST-Agent given the static pipeline's real tools (2026-08-16)
+
+Direct follow-up question after the sentence+VS static result above:
+the agent SHOULD be able to reach this level and learn why it wins —
+what's stopping it? Answer, from direct inspection, was a real
+STRUCTURAL capability gap, not just the stopping-rule issue already
+diagnosed earlier: `ghost_tools.py`'s `tool_encode_bidi` only exposed 6
+manually-parameterized config families (no searched permutation), and
+`tool_encode_vs` only exposed a fixed-length keyed payload (no
+logprob-guided adaptive depth) — the agent could never have proposed
+the static test's encoding because the mechanisms that produced it
+were never available as tools. Two smaller compounding factors also
+apply: the agent doesn't choose field-vs-sentence SCOPE itself (that's
+the caller's `target` argument, decided before the loop starts), and
+its reflection has no ceiling reference (`tool_hamming` returns a raw
+integer, never "X% of theoretical max"), so even a strong result
+wouldn't be recognizable to the agent AS strong.
+
+**Fix — three new tools added to `ghost_tools.py`, giving the agent the
+SAME primitives the static pipeline used:**
+- `tool_bidi_permute(text, trials=2000)` — wraps
+  `bidi_permute.find_target_permutation` + `decompose` + `encode`. No
+  proxy model needed (pure search + a real bidi-render check), always
+  available.
+- `tool_encode_vs_logprob(text, payload, threshold_tau)` — wraps
+  `encode.encode_char_with_vs_logprob` per character, keyed the same
+  way `tool_encode_vs` already is (`derive_payload_bytes(payload,
+  salt, char_index, n_bytes=64)`) but depth is now ADAPTIVE (driven by
+  a real proxy logprob check) instead of fixed by payload length.
+- `tool_combine_permute(text, trials, payload, threshold_tau)` — both
+  of the above in one call, mirroring `tool_combine`'s role as the
+  strongest single tool. Same bidi-then-VS ordering rule as `combine`.
+
+Both `encode_vs_logprob`/`combine_permute` need a live proxy model,
+which is caller-owned (never loaded by `ghost_tools.py` itself) via new
+`set_proxy_model()`/`clear_proxy_model()` module-level functions — a
+call without one first raises a clear `RuntimeError`, caught by
+`execute_tool_call`'s existing try/except and surfaced as a normal
+`"ERROR: ..."` tool result, so a run without a proxy degrades
+gracefully (falls back to the original 6 tools) instead of crashing.
+**GPU-sharing between the proxy and the search-tier ensemble/agent
+backbone is NOT yet wired up** (no `release_gpu()`-style coordination
+for the proxy specifically) — whoever loads it is responsible for not
+colliding with either, same as `verify_ghost_permute_sentence_track_a.py`'s
+own explicit load/del/`empty_cache` lifecycle.
+
+**Wiring**: `agent_backbone.py`'s `TOOL_DEFINITIONS` gained matching
+schema entries for all three (auto-propagates into
+`LocalReActBackbone`'s text-protocol description too, since
+`_build_tool_protocol_text` builds itself from `TOOL_DEFINITIONS`).
+`extract_config_from_tool_calls` now recognizes `bidi_permute`/
+`combine_permute` (recorded as `f"bidi_permute(trials={trials})"` since
+a searched permutation has no short config string worth printing) and
+`encode_vs_logprob`. `run_ghost_agent` gained a `proxy=` param — when
+given, calls `set_proxy_model()`/`clear_proxy_model()` around the loop
+automatically, so a caller just loads the proxy and passes it in,
+without needing to know `ghost_tools`' internals.
+
+**Prompt updated** (`ghost_agent_prompt.py`): the agent is now told
+about all three new tools, instructed to try them first and silently
+fall back to the original 6 on an `ERROR` result (no proxy loaded this
+run), and pointed at the concrete evidence for why
+`combine_permute`/`bidi_permute` are worth preferring — the sentence+VS
+static result immediately above (86/88 Hamming, defeated `gpt56_sol`
+where a manually-configured encoding at the SAME maximum Hamming
+distance did not).
+
+**Verified (mocked, no GPU/API):** new
+`tests/smoke_test_ghost_tools_permute.py` covers `tool_bidi_permute`'s
+round-trip correctness with no proxy; both new proxy-dependent tools
+correctly erroring with no proxy set, working correctly against a fake
+proxy (deterministic `query_logprob` stand-in), and correctly
+re-erroring after `clear_proxy_model()`; `TOOL_DEFINITIONS`/
+`TOOL_FUNCTIONS` registration; and `extract_config_from_tool_calls`'s
+handling of all three new tool names. All 5 existing smoke test suites
+(`smoke_test_task5`, `smoke_test_agent_backbone`, `smoke_test_ensemble`,
+`smoke_test_search_calibration`, plus this new one) still pass.
+
+**Clarifying the Qwen proxy's role before the real run** (user question,
+worth recording since it surfaces a residual risk not previously
+flagged for the agent specifically): the agent never directly "sees"
+Qwen2.5-7B — it's invoked only INSIDE `encode_vs_logprob`/
+`combine_permute`'s tool implementation to decide per-character VS
+depth; the agent just gets back the finished encoded string, same as
+any other tool call. Qwen is NOT one of the four search-tier ensemble
+judges (`agent_ensemble.members` already excludes `qwen25_7b`/
+`qwen25_3b` specifically to avoid proxy-as-judge circularity — this was
+already true before these tools existed). **Residual risk, not fully
+resolved**: `deepseek_r1_14b` (an actual judge) is a Qwen-tokenizer-
+family distill, so VS depth calibrated to fool Qwen's logprob could
+transfer unusually well to `deepseek_r1_14b` specifically for shared-
+tokenizer reasons, inflating that judge's "defended" vote independent
+of genuine cross-tokenizer robustness — same underlying category of
+risk as the `qwen25_7b`-excluded-as-judge rule, just via construction
+bias instead of judge circularity. Not new to the agent — the static
+pipeline has used exactly this Qwen-as-sole-constructor setup the whole
+project (Qwen's own target-model result is already labeled
+"proxy-optimised" and excluded from the transferability claim) — the
+agent's new tools just expose the same pre-existing tension in a new
+place.
+
+**First real run (2026-08-16), Claude Haiku backbone, live Qwen2.5-7B
+proxy loaded via `proxy=`** (`src/verify_agent_with_permute_tools.py`):
+same field/sentence as the two static checks above
+(`regfiling_0000`/`jurisdiction_code`, sentence-scope, real Track A
+data — so, correctly, `frontier_check_fn` was NOT used during search,
+only as a post-hoc verify-tier check, per the calibration-only
+constraint). **Result: the agent used the OLD `combine()` tool
+(`full_rtl` + `"ghost"` payload) — it never called `combine_permute`,
+`bidi_permute`, or `encode_vs_logprob` at all**, despite all three being
+available. Hamming 84/88 (respectable, but below the static
+`ghost_permute_sentence` check's 86/88). Cleared the local ensemble 4/4
+in 1 iteration, stopped immediately — the same weak-stopping-rule
+pattern as every other real run this session. `gpt-5.6-sol` (verify
+tier, post-hoc) then extracted `'VIC-23'` correctly — same failure mode
+already seen repeatedly against this model.
+
+**Root cause found and fixed**: `build_iteration_prompt`'s iteration-1
+message (`ghost_agent_prompt.py`) HARDCODED "Begin by trying combine()
+with 'full_rtl' config" — a concrete per-turn instruction that silently
+overrode the system prompt's own new guidance to prefer
+`combine_permute`. A specific per-turn instruction beats a general
+system-prompt suggestion, which is exactly why the agent defaulted to
+the old tool on the very first (and only) iteration it ran. Fixed:
+iteration-1 message now tries `combine_permute` first (trials=2000,
+payload="ghost", threshold_tau=-8.0), falling back to `combine()` only
+on an `ERROR` result (no proxy loaded). Verified `smoke_test_task5.py`
+still passes after this change (its `FakeClient` doesn't assert on the
+literal prompt text, only on scripted tool_use responses).
+
+**What this run clarifies about "what's agentic here" (direct user
+question)**: now that the agent has access to the SAME underlying
+mechanisms the static pipeline uses, the theoretical difference is no
+longer "what it can build" but "whether it builds ADAPTIVELY, using
+real feedback, instead of a fixed blind recipe" --- specifically: (1)
+the static pipeline's objective at encoding time is blind (maximize
+Hamming + one proxy's logprob threshold, uniformly, never checking if
+it actually defeats extraction until later evaluation), while the
+agent observes a REAL per-attempt extraction verdict before deciding
+what to try next; (2) the static pipeline always runs the identical
+fixed sequence for every field, while the agent can in principle branch
+strategy per instance and reason about which specific judge keeps
+succeeding; (3) `strategy_memory.json` gives the agent real cross-
+document persistence (confirmed working, Level 3 mechanism) that the
+static pipeline has zero equivalent of; (4) `tool_analyse_structure`
+gives the agent content-type adaptivity the static pipeline lacks.
+**This run shows those advantages are currently theoretical, not
+demonstrated** — the agent didn't exercise ANY of them (no strategy
+branching was needed, no memory was used since `use_memory=False`, no
+adaptive tool choice happened due to the prompt bug just fixed) because
+it cleared the weak bar trivially on iteration 1, exactly as static
+processing would. A real test of the fixed prompt, ideally on a field
+where the local ensemble does NOT cave on iteration 1, is what would
+actually demonstrate agentic value over static — not yet done.
+
+**Re-run after the prompt fix (2026-08-16, same day), confirms the fix
+worked — and surfaces a new, real finding about the tool itself:** same
+field/sentence, same backbone/proxy. `extract_config_from_tool_calls`
+now correctly reports `bidi_config="bidi_permute(trials=2000)"`,
+`vs_payload="ghost"` — the agent DID call `combine_permute` on
+iteration 1 this time, exactly as intended. But: **Hamming came back
+81/88 — LOWER than both the manually-configured `combine()`+`full_rtl`
+attempt from the first run (84/88) and the static
+`ghost_permute_sentence` check earlier (86/88).** Local ensemble still
+4/4 defended, 1 iteration, and `gpt-5.6-sol` (verify tier, post-hoc)
+still extracted `'VIC-23'` correctly — same failure as every other real
+run against this model on this field, and this time with a WORSE
+Hamming distance than the run that didn't even use the new tool.
+
+**Root cause, found by checking the implementation**:
+`tool_bidi_permute`/`tool_combine_permute` (`ghost_tools.py`) call
+`find_target_permutation(text, trials=trials)` with NO seed argument —
+always the function's own hardcoded default (`seed=0`). The static
+pipeline's `encode_ghost_permute_sentence`, by contrast, derives a
+per-field/sentence KEYED seed
+(`_derive_int_seed(seed, salt, "ghost_permute_sentence", item["id"],
+sentence_text)`) before searching — a genuinely different starting
+point for the same 2000-trial random search. Since `find_target_permutation`
+only samples 2000 of an enormous permutation space, WHICH seed you
+start from matters a lot for a fixed trial budget — this instance's
+default seed=0 draw happened to land on something worse than even a
+naive plain-reversal baseline (a full reversal of an 88-character
+non-palindromic sentence already achieves Hamming ~84-88 "for free," no
+search needed). **This is a real, actionable tool limitation, not a
+one-off fluke**: the agent has no way to escape a bad default-seed draw
+— `payload` lets it diversify VS injection, but nothing lets it
+diversify the permutation search itself. Natural fix: add an optional
+`seed` parameter to `tool_bidi_permute`/`tool_combine_permute` (default
+0 for back-compat) so the agent — or a calling harness — can retry with
+a different seed when a given trial budget's result isn't good enough,
+mirroring the flexibility `payload` already provides for VS. **Not yet
+implemented** — this session's scope stopped at diagnosing it.
+
+**Updated read on "what's agentic here"**: the prompt fix successfully
+got the agent to invoke the new tool, so the earlier finding (theoretical
+advantages, not yet exercised) is partially addressed — tool *selection*
+is now working as intended. But this run adds a new, orthogonal
+limitation: even when the agent uses the objectively "correct" strongest
+tool, a hardcoded implementation detail (fixed seed) can make it perform
+WORSE than either a naive fallback or the static pipeline's own use of
+the identical underlying mechanism. This reinforces the running theme
+across this whole investigation: "agentic" is not automatically better —
+every claimed advantage (tool access, adaptivity, memory) needs the
+underlying plumbing to actually support it, and this session has found a
+real, fixable gap at nearly every layer checked so far (reflection
+placeholder, stopping rule, missing tools, prompt override, now a fixed
+search seed).
+
+**Not yet done**: add the `seed` parameter and re-test; a field/sentence
+hard enough that the agent needs 2+ iterations (everything tested so
+far converges in 1, a floor effect that gives no room to observe
+adaptive strategy change); a real comparison of `strategy_memory`-driven
+principle reuse against a cold run on similar content.
+
+Full results saved to
+`results/raw/verify_agent_with_permute_tools_jurisdiction_code.json`
+(overwritten by the re-run — the first attempt's `combine()`-based
+result is only preserved in this file's own history above, not on
+disk).
 
 ### Normalization-attack verification (scratch scripts, real API calls)
 
@@ -899,7 +1487,7 @@ systematic. This has not been started yet.
   `_call_openai` sends `max_completion_tokens`, not `max_tokens` —
   `gpt-5.6-sol` rejects the latter too.
 
-## Track A dataset generation (`plans/TRACK_A_SPEC.md`) — IN PROGRESS as of 2026-08-14
+## Track A dataset generation (`plans/TRACK_A_SPEC.md`) — GENERATION COMPLETE, flags triaged (2026-08-16)
 
 `src/track_a_generate.py` generates synthetic documents (DeepSeek-R1-Distill-
 Qwen-14B, local GPU inference) for Phase 2 full (250 docs/domain, 1000 total)
@@ -945,11 +1533,348 @@ job in the `track_a_full` chain; `python3 -c "import json; print(len(json.load(o
 for instances completed; `tail logs/track_a_full_<latest_jobid>.log` for
 recent activity; grep `generation_log.jsonl` for `format_invalid`,
 `field_name_mismatch`, `literal_example_copy_unresolved`,
-`collision_review` flags — none of these have been triaged yet.
+`collision_review` flags — all triaged now, see below.
 
-**Do not publish to HuggingFace yet** — wait until the full 1000-instance
-run completes AND the validator-flagged instances above are reviewed. Also
-worth deciding at that point whether to bundle the release with the encoded
-GHOST conditions (`src/encode.py` output) rather than shipping raw/clean
-documents alone, since the paper's actual experiments run on the encoded
-versions, not the raw generation.
+**Generation completed 2026-08-15** (`.generation_complete.full` marker
+present): 1000/1000 instances, 0 `generation_failed`, `sbatch`'s
+resubmit chain only needed 2 of its 12-resubmit budget.
+
+**Flag triage (2026-08-16), all 1000 docs' `generation_log.jsonl` flags
+inspected directly, not just counted:**
+
+- **`char_span_unresolved` (73 field-instances / 67 docs) — real bug,
+  now partially fixed.** This flag means the model's reported ground
+  truth doesn't appear verbatim in the generated document text.
+  `verify_char_span` (`src/track_a_generate.py`) only ever did an
+  exact-substring check, so it missed two recoverable classes: (1)
+  case/whitespace/dash differences between the reported `value` and how
+  it's actually written in the prose (e.g. reported `PVT LTD`, text says
+  `Pvt Ltd`) — **10/73**; (2) the same digits regrouped differently
+  (e.g. reported `123 456 789 012`, text has `123 45 678 9012`) —
+  **25/73**. Fixed: `verify_char_span` now retries with a
+  case/whitespace/dash-insensitive flexible-regex pass, then a
+  digits-only pass, before giving up. The remaining **38/73 (≈3.8% of
+  all 1000 docs) are genuine paraphrase** — e.g. ground truth `QLD-10`
+  but the text only says "Queensland"; `PUB CO` vs. "public company" —
+  and are NOT recoverable by any string-matching fix; these fields are
+  not actually verbatim-extractable from their document and stay
+  `unresolved`. **Decision on excluding these 38 field rows from the
+  eval-ready field set is still open** — deferred, not yet decided.
+- **`field_name_mismatch` (5) / `field_missing_in_output` (3) — all
+  ABN-specific, one real metadata bug found.** The model sometimes
+  reports the ABN field under a different key (`abn_format`, lowercase
+  `abn`) or adds unrequested extra fields. For 3 docs
+  (`regfiling_0031/0054/0175`) this silently dropped the ABN field
+  record entirely, but `documents.jsonl`'s `field_count` still counted
+  the *requested* field list (4) instead of what actually made it into
+  `fields.jsonl` (3) — a real, verified mismatch. Fixed: `field_count`
+  is now derived from `len(field_records)` after the field loop, not
+  `len(field_names)` before it. **Not fixed:** the model's ABN
+  field-naming inconsistency itself — still a live generation quirk if
+  Track A is ever regenerated or extended.
+- **`format_invalid` (367, 362 of them ABN) — not a bug, a model
+  capability limit.** `validate_abn_format` (`src/track_a_validators.py`)
+  correctly implements the real ATO modulus-89 ABN checksum (tested
+  against a real published ABN). The model was asked to generate a
+  checksum-valid ABN and failed ~36% of the time. Doesn't affect FEA
+  (ground truth is whatever string is in the text, checksum-valid or
+  not) — just means these ABNs aren't real by checksum; worth a doc
+  note if Track A framing ever implies they are.
+- **`collision_review` (601) — not a quality signal.** `check_collision`
+  unconditionally flags every instance containing an `ABN`/`doi_suffix`/
+  `grant_id` field for "needs manual external-registry spot-check,"
+  regardless of the actual value — no automated check was ever
+  implemented beyond the flag. This is a **publish-policy question**
+  (could a synthetic value coincidentally collide with a real
+  registered identifier?), not a generation defect. Still unresolved:
+  decide before HF publish whether a real spot-check is needed for
+  these ~601 instances or the risk is accepted with a documented
+  caveat.
+- **`char_span_realigned` (3229) — benign**, the realignment mechanism
+  (span drifted during generation, value still found exactly elsewhere
+  in text) working as designed.
+
+**Post-hoc data patch applied** (not a full regeneration — both fixes
+are pure re-derivations from already-stored `carrier_text` +
+`ground_truth`, no model call needed): backed up pre-patch files to
+`data/track_a/full/_pre_triage_backup/`, then re-ran the fixed
+`verify_char_span` over every `unresolved` field row (35 recovered →
+`char_span_status: "realigned_posthoc"`, 38 confirmed genuine
+paraphrase, left `unresolved`) and recomputed `field_count` for all
+1000 docs (3 corrected) directly against the live `data/track_a/full/`
+files. `generation_log.jsonl`'s own flags were updated to match
+(`char_span_unresolved:X` → `char_span_realigned_posthoc:X` for the 35
+recovered), so the log doesn't silently disagree with `fields.jsonl`
+anymore.
+
+**Do not publish to HuggingFace yet** — two open decisions remain: (1)
+whether to exclude the 38 genuinely-unresolvable field rows from the
+eval-ready field set (or hand-fix/regenerate just those), and (2)
+whether the 601 `collision_review`-flagged ABN/DOI/grant-ID instances
+need a real external-registry spot-check before release, or the risk is
+accepted with a documented caveat. Also still worth deciding at that
+point whether to bundle the release with the encoded GHOST conditions
+(`src/encode.py` output) rather than shipping raw/clean documents alone,
+since the paper's actual experiments run on the encoded versions, not
+the raw generation.
+
+## Seed fix for `bidi_permute`/`combine_permute`, and `convergence.py` proxy wiring (2026-08-17)
+
+Direct follow-up to the "Agentic-ness critique and calibration" session
+above: the diagnosed-but-unfixed root cause of the agent's `combine_permute`
+attempt scoring WORSE (81/88) than even the older `combine()` tool (84/88)
+on `regfiling_0000`'s sentence was `tool_bidi_permute`/`tool_combine_permute`
+(`src/ghost_tools.py`) always calling `find_target_permutation` with the
+implicit default `seed=0` — no way for the agent to escape a bad draw
+within its `trials` budget.
+
+**Fixed:** both tools now take an optional `seed: int = 0` param, threaded
+straight to `bidi_permute.find_target_permutation(seed=seed)`.
+`agent_backbone.py`'s `TOOL_DEFINITIONS` schemas for `bidi_permute` and
+`combine_permute` gained a matching `seed` property (auto-propagates into
+`LocalReActBackbone`'s text-protocol tool description too, since that's
+built programmatically from `TOOL_DEFINITIONS`). `extract_config_from_tool_calls`
+now records the seed actually used (e.g. `"bidi_permute(trials=2000,seed=0)"`,
+was previously just `"bidi_permute(trials=2000)"`) so reflection/strategy_memory
+can see it. `ghost_agent_prompt.py`'s system prompt now explicitly tells the
+agent: if a `combine_permute`/`bidi_permute` result isn't near-maximal Hamming
+distance, retry with a DIFFERENT seed before accepting the result as final —
+this was previously not something the agent could even do, let alone was
+told to try. `tests/smoke_test_ghost_tools_permute.py`'s two assertions on
+the recorded config string were updated to match the new format; all smoke
+tests (`smoke_test_ghost_tools_permute`, `smoke_test_search_calibration`,
+`smoke_test_task5`, `smoke_test_agent_backbone`, `smoke_test_ensemble`,
+`smoke_test_task6`) still pass. **Not yet re-verified against a real run**
+(no GPU was live at the time this landed) — see the plan below for what
+that real run should look like.
+
+**`convergence.py` gained a `use_proxy`/`--use_proxy` param.** Previously,
+`convergence.py` never passed a `proxy=` into `run_ghost_agent`, so in every
+batch run so far `combine_permute`/`encode_vs_logprob` silently errored out
+(caught by `execute_tool_call`'s existing try/except, surfaced as a normal
+`ERROR: ...` tool result) and the agent fell back to `combine()`/`encode_bidi()`
+— only `bidi_permute`'s search (no proxy needed) was ever actually reachable
+in a batch context. This means **every prior `agent_convergence.csv` row
+was produced without access to the real logprob-guided VS mechanism at
+all** — worth remembering when reading old rows in that CSV, they're not
+directly comparable to rows produced with `--use_proxy`. Fixed: `--use_proxy`
+loads Qwen2.5-7B-Instruct once before the document loop (mirrors the
+already-existing load-backbone-once pattern for `--agent_backbone`), passes
+the SAME `proxy` object into every field's `run_ghost_agent` call, and
+unloads it (`del` + `torch.cuda.empty_cache()`) in the loop's `finally`.
+Verified via `smoke_test_task6.py` (mocked `run_ghost_agent_fn`, whose
+`**kwargs` already absorbed the new `proxy` kwarg harmlessly) — not yet
+verified against a real proxy load.
+
+**Plan for the next real run, to be picked up directly from an active GPU
+allocation (user has an A100 interactive job live as of 2026-08-17):**
+1. Pilot first, NOT straight to 100-200 docs — this session's own repeated
+   lesson (see the agentic-ness critique above) is that every "obvious"
+   fix so far needed a real run to confirm it actually helped, and cost/time
+   at this agent-loop's per-iteration ensemble load/unload rate is still
+   only estimated, not measured post-seed-fix. Recommended: 10-20 docs
+   first (`python src/convergence.py --n_samples 15 --max_iterations 5
+   --agent_backbone claude_haiku --use_proxy`), from the repo root with
+   the venv activated (`source venv/bin/activate`).
+2. Backbone: `claude_haiku` (user's choice, cost reasons) — pass
+   `--agent_backbone claude_haiku`.
+3. Check after the pilot: (a) does the agent actually call `bidi_permute`/
+   `combine_permute` with a non-zero seed on a retry when Hamming is
+   low (the system-prompt instruction is new and unverified against a
+   real model); (b) does `agent_hamming` in `results/tables/agent_convergence.csv`
+   improve versus pre-seed-fix rows on similar field lengths; (c) real
+   per-field wall-clock time with `--use_proxy` (Qwen adds a load at the
+   start, but shouldn't add per-iteration cost since it's loaded once,
+   unlike the search-tier ensemble which still reloads every iteration
+   per the existing GPU-sharing constraint).
+4. If the pilot looks reasonable (iteration counts and wall-clock in a
+   plausible range, no crashes, real Hamming improvement vs. the
+   `agent_convergence.csv` rows from before this fix), scale up toward the
+   100-200 doc range the original question asked about, ideally in
+   batches via `--start_index` so a `sinteractive` time-limit boundary
+   doesn't lose progress (the CSV write is append-only, per-doc-index
+   deterministic sampling already supports this).
+5. This IS the direct test of the still-unproven Level 3 question from
+   the self-improving audit above: does `agent_iterations`/`agent_hamming`
+   in the CSV actually trend better as `doc_index` increases (memory
+   accumulating real principles) now that the agent also has a working
+   seed-diversification escape hatch? Plot `agent_iterations` and
+   `agent_hamming` against `doc_index` once there's enough data — this
+   was explicitly flagged as not yet done at any N large enough to see a
+   trend.
+6. Remember this batch still runs against `data/raw/documents.json`
+   (field-scope, the older synthetic dataset), NOT Track A and NOT
+   sentence-scope — those remain separate, not-yet-batch-wired axes (see
+   "Sentence-level obfuscation" and Track A sections above). Don't
+   conflate a result from this run with a Track A or sentence-scope
+   claim.
+
+## Margin-aware stopping + agent-initiated scope widening (2026-08-18)
+
+Direct response to a readiness critique raised mid-session: GHOST-Agent
+could search adaptively within a fixed problem (a given target string,
+a fixed toolset), but had no way to decide the problem itself was too
+narrow — scope (field vs. sentence) was always fixed externally by
+whoever called `run_ghost_agent`, and the stopping rule
+(`ensemble_result["defended"]`, i.e. `consensus_threshold` local models
+failing) was a single binary check with no margin, which is exactly why
+every real run this whole session converged in 1 iteration. An agent
+that can't push past a bar it clears trivially isn't self-improving in
+any meaningful sense — it's a smarter static pipeline with memory
+bolted on. Two fixes, both opt-in and fully back-compat (verified: all
+6 pre-existing smoke test suites pass unchanged with both left at their
+defaults).
+
+**Fix 1 — `require_unanimous` (`ghost_agent.py`).** New
+`run_ghost_agent`/`_run_ghost_agent_loop` param, default `False`. When
+`True`, the loop only stops at FULL ensemble consensus (every valid
+member defeated), not just `consensus_threshold` (e.g. 3-of-4) — and
+when it clears the weaker bar but not the full one, the per-iteration
+result message now explicitly tells the agent its margin is thin and to
+retry a seed/payload or call `widen_scope()`, instead of silently
+accepting a narrow win. The returned dict's `"success"` key now reflects
+this stricter `should_stop` bar via a new `final_success` local
+variable — `memory.succeeded` (the old source of that field) is `True`
+the instant ANY attempt clears the bare `consensus_threshold`, which
+under `require_unanimous=True` can be an iteration this loop correctly
+judged insufficient and kept going past.
+
+**Real bug found and fixed getting this to interact correctly with the
+existing calibration-only frontier gate**
+(`ensemble.run_ensemble_query`'s `frontier_check_fn`, see "Agentic-ness
+critique and calibration" above): the first version of `should_stop`
+computed `is_full_consensus` purely from the LOCAL ensemble's
+`n_failed`/`n_valid`, with no awareness that a frontier gate can
+overturn `ensemble_result["defended"]` back to `False` even when the
+local tier is unanimous. This meant `require_unanimous=True` could stop
+the loop on "full LOCAL consensus" one line after a real frontier model
+had just proven it could still extract the value — confirmed for real,
+not hypothetical (see the calibration run below, first attempt).
+Fixed: `should_stop = ensemble_result["defended"] and (is_full_consensus
+if require_unanimous else True)` — ANDing with the (possibly
+gate-overturned) `defended` flag means an overturn is never ignored,
+and when `require_unanimous=False` this reduces to exactly the
+pre-existing `ensemble_result["defended"]` check (unchanged behavior).
+Regression test added (`tests/smoke_test_agentic_scope.py`, "Test 3")
+reproducing this exact shape: local unanimous-but-frontier-overturned
+on iteration 1, frontier finally also failing on iteration 2 — asserts
+the loop does NOT stop after iteration 1.
+
+**Fix 2 — `widen_scope()` tool (`ghost_tools.py`, `agent_backbone.py`,
+`ghost_agent.py`, `ghost_agent_prompt.py`).** A tenth tool the agent can
+call itself, mid-run, to re-target its encoding from the original
+`target` to a caller-supplied `wider_context` (e.g. the sentence
+containing a field) — previously this was fixed for the whole run by
+the caller, with no lever for the agent to decide the current target
+isn't defensible on its own. `run_ghost_agent` gained a
+`wider_context: Optional[str] = None` param, registered via
+`ghost_tools.set_wider_context()`/cleared via `clear_wider_context()`
+(same lifecycle pattern as the existing `proxy` param). When `None`
+(default), `widen_scope()` returns a harmless `ERROR` string and the
+agent must keep working with `target` — zero change for every existing
+caller. When given, and the agent calls `widen_scope()` mid-turn: the
+loop detects this via `backbone.last_tool_calls`, flips internal
+`effective_target`/`effective_clean_reference_text` to `wider_context`
+(one-way, never back), resets `best_hamming`/`best_encoding` since the
+scale changed, and recomputes `content_profile` from the wider text for
+principle distillation. Critically, `field_ground_truth`/
+`clean_reference_value` (what counts as a successful extraction) are
+**never** touched by a widen — obfuscating more surrounding text must
+never change what "defended" means for the underlying field. Result
+dict gained `scope_widened`/`final_target` keys so this is visible
+after the fact. System prompt (`ghost_agent_prompt.py`) updated to
+document both fixes and instruct the agent: retry a seed/payload before
+widening, and only widen after that's been tried — widening isn't a
+free first move (larger encoded payload, more conspicuous).
+
+### Real run 1 — floor effect at the OPPOSITE end (`src/verify_agentic_scope_track_a.py`)
+
+Same Track A field as every other real check this session
+(`regfiling_0000`/`jurisdiction_code = 'VIC-23'`), started at FIELD
+scope (not sentence) with `wider_context` set to the field's sentence
+and `require_unanimous=True`, live Qwen proxy loaded (so
+`combine_permute`/seed retry are available), Claude Haiku backbone, no
+`frontier_check_fn` (real eval data, not calibration — the firewall
+rule holds).
+
+**Neither new mechanism fired.** `combine_permute(seed=0, trials=2000)`
+hit Hamming **6/6 — the true maximum possible** for this 6-character
+field, and the search-tier ensemble came back 4/4 (full unanimity) on
+iteration 1. With the bar already perfectly cleared, there was nothing
+to retry or escalate past. This is a DIFFERENT floor effect from the
+one `require_unanimous` was built to fix: a short field's permutation
+space is small enough that a 2000-trial search at the default seed
+already finds the true optimum, so the fix had nothing to bite on here
+— not a flaw in the fix, just the wrong test case for exercising it.
+
+Post-hoc frontier verify (3 real models): `claude_sonnet` DEFENDED
+(garbled misread), `gpt56_sol` **EXTRACTED** `'VIC-23'` correctly
+(consistent with every other result against this model on this exact
+field all session — static bidi-only max-Hamming, static
+`ghost_permute_sentence`, and now this), `gemini_31_pro` DEFENDED
+(echoed the raw stored sequence back, not blind, just didn't solve it).
+Full result:
+`results/raw/verify_agentic_scope_track_a_jurisdiction_code.json`.
+
+### Real run 2 — retry logic fires for real, on the calibration split (`src/verify_agentic_scope_calibration.py`)
+
+To actually force a non-trivial first attempt, this run combined the
+new fixes with the existing calibration-only frontier gate
+(`adversary.make_frontier_check_fn`, disjoint `data/raw/calibration.json`
+split, never real eval data — see "Agentic-ness critique" above for why
+this firewall exists) on `cal_fin_001`/`reference_number =
+'REF-7W8R4NEA'`, a field `calibrate_agent_search.py` had already shown
+needs multiple iterations under this exact gate. `require_unanimous=True`,
+`wider_context` set to the field's sentence, live Qwen proxy, Claude
+Haiku backbone. The FIRST attempt at this run (before the should_stop
+bugfix above) silently reported `success=True` after 1 iteration despite
+`gpt56_sol` genuinely extracting the value — exactly the bug described
+above, caught by inspecting this run's own output, then fixed and
+re-run.
+
+**After the fix, real 3-iteration trace:**
+
+| iter | seed | trials | VS payload | threshold_tau | Hamming | local ensemble | `gpt56_sol` |
+|---|---|---|---|---|---|---|---|
+| 1 | 0 | 2000 | `ghost` | -8.0 | 11/12 | unanimous (3/3) | extracted — gate overturns, continues |
+| 2 | 1 | 3000 | `aaaaaa` | -8.0 | **12/12 (max)** | unanimous | still extracted — gate overturns again |
+| 3 | 3 | 3000 | `ghostghostghost` | **-10.0** | 12/12 (max) | unanimous | failed (`"NAE4R7-8WERF"`, garbled) — gate finally passes |
+
+The agent genuinely varied strategy across all 3 iterations (new seed,
+increased trial budget, longer/stronger VS payload, and on iteration 3
+a self-initiated `threshold_tau` tightening beyond the -8.0 default
+mentioned anywhere in its prompt) using real per-iteration frontier
+feedback — this is the first real evidence of the retry mechanism doing
+something, not just being reachable. `widen_scope()` was never called;
+the agent found a win within field scope by pushing VS strength harder,
+so scope escalation wasn't needed on this field.
+
+**The clean finding: iterations 2 and 3 hit the IDENTICAL Hamming
+distance (12/12, the theoretical maximum for this field) but only
+iteration 3 defeated `gpt56_sol`.** The only difference was VS payload
+strength/threshold. This is a controlled same-model, same-field,
+same-Hamming comparison — not an anecdote — directly confirming this
+session's repeated finding that Hamming distance saturating at its max
+says nothing about defense against a specific model; VS injection
+depth is doing real, independent work past that point.
+
+**Caveats, not silently proceeded past:** N=1 field. This result is
+calibration-split data queried directly against `gpt56_sol` during
+search — by design NOT a transferability claim for that model (that's
+the entire point of the firewall; a search that succeeds here should be
+read as "the mechanism can be pushed to defeat this specific model when
+given real feedback," not as a held-out result). `gpt56_sol`'s
+already-documented non-determinism (rejects `temperature=0`) means this
+exact 3-iteration trace might not replicate on a re-run. `widen_scope()`
+still has ZERO real (non-mocked) exercise — both real runs so far found
+success without needing it. Full result:
+`results/raw/verify_agentic_scope_calibration_reference_number.json`.
+
+**Not yet done:** a real run where `widen_scope()` actually fires (needs
+a field/sentence combination where seed/payload retries alone don't
+close the gap); wiring `wider_context`/`require_unanimous` into
+`convergence.py`'s batch loop (both are currently only exercised via
+one-off scratch scripts, same status as every other `verify_*.py` file);
+distilling "VS strength matters independently of Hamming" into an
+actual `strategy_memory` principle instead of leaving it as a narrative
+finding in this file.

@@ -31,7 +31,7 @@ hardcode the adversary."
 import os
 import sys
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 sys.path.insert(0, os.path.dirname(__file__))
 from unicode_utils import strip_think_tags  # noqa: E402
@@ -110,6 +110,48 @@ def query_adversary(
             time.sleep(2 ** attempt)
 
     return "ERROR"
+
+
+def make_frontier_check_fn(model_key: str, config: dict) -> Callable:
+    """
+    Build a (encoded_text, field_name, ground_truth) -> dict callable
+    around a single named config.yaml api_models entry, for use as
+    ensemble.run_ensemble_query's CALIBRATION-ONLY frontier_check_fn.
+
+    Only ever pass the returned callable to a run_ghost_agent call over
+    the disjoint data/raw/calibration.json split (see
+    src/calibrate_agent_search.py) -- never over real eval/Track A data.
+    See run_ensemble_query's and run_ghost_agent's docstrings for why.
+
+    Args:
+        model_key: a key into config["api_models"] (e.g. "gpt56_sol" --
+            the model the user manually confirmed extraction against via
+            the ChatGPT UI, making it the natural first calibration check)
+        config: parsed config.yaml dict
+
+    Returns:
+        Callable matching run_ensemble_query's frontier_check_fn contract:
+        returns {"name", "extracted", "refusal", "response"}.
+    """
+    spec = config["api_models"][model_key]
+
+    def _check(encoded_text: str, field_name: str, ground_truth: str) -> dict:
+        response = query_adversary(
+            encoded_text=encoded_text,
+            field_name=field_name,
+            model_id=spec["model_id"],
+            provider=spec["provider"],
+            max_tokens=spec.get("max_tokens", 100),
+        )
+        result = check_extraction(response, ground_truth)
+        return {
+            "name": model_key,
+            "extracted": result["extracted"],
+            "refusal": result["refusal"],
+            "response": result["response"],
+        }
+
+    return _check
 
 
 def _call_anthropic(model_id: str, prompt: str, max_tokens: int) -> str:

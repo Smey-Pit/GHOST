@@ -204,6 +204,20 @@ api_models:
     model_id: "claude-sonnet-4-6"
     max_tokens: 50
     temperature: 0
+  claude_haiku:
+    provider: "anthropic"
+    model_id: "claude-haiku-4-5"
+    max_tokens: 50
+    temperature: 0
+                           # NOT added to agent_ensemble.frontier_verify_models --
+                           # that production list stays untouched; this entry
+                           # exists so a one-off verify-tier script can query
+                           # claude_haiku directly (agent_backbones.options.
+                           # claude_haiku is a SEPARATE section, used only for
+                           # the agent backbone role, not the adversary role --
+                           # both entries can point at the same real model
+                           # since one script CAN use Haiku as both, see that
+                           # script's own circularity caveat).
   claude_opus:
     provider: "anthropic"
     model_id: "claude-opus-4-6"
@@ -264,6 +278,18 @@ agent_ensemble:
                              # converged encoding, never mid-search
                              # (cost control -- see project memory on
                              # search/verify gap reporting)
+                             # NOTE: a SEPARATE mechanism now exists for
+                             # deliberately consulting a frontier model
+                             # DURING search -- src/ensemble.py's
+                             # run_ensemble_query(frontier_check_fn=...),
+                             # driven by src/calibrate_agent_search.py.
+                             # It must ONLY ever be run against the
+                             # disjoint data/raw/calibration.json split,
+                             # never here against real eval/Track A
+                             # fields -- doing so would optimise the
+                             # search directly against whichever frontier
+                             # model is checked, invalidating that
+                             # model's later transferability number.
 
 # ── In-context defense ────────────────────────────────────────
 inctx_models:

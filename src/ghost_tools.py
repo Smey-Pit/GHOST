@@ -282,6 +282,255 @@ def tool_encode_bidi(text: str, config: str) -> str:
     return ""  # unknown config
 
 
+# ── Optional proxy-model-backed tools (permutation search + real
+#    logprob-guided VS injection) ────────────────────────────────────
+#
+# Unlike every tool above, these need a live language model resident on
+# GPU -- src/encode.py's actual production mechanism for both halves of
+# GHOST (bidi_permute's searched separable permutation, and
+# encode_char_with_vs_logprob's adaptive per-character VS depth) is
+# strictly more powerful than the manually-parameterized configs and
+# fixed-length payloads the tools above expose, but neither is reachable
+# through them. This is a real, structural capability gap: an agent
+# reasoning as well as possible still cannot propose an encoding whose
+# building blocks were never given to it as tools.
+#
+# The proxy model is caller-owned, not loaded here -- set_proxy_model()
+# must be called (with an encode.ProxyModel-shaped object: a
+# .query_logprob(target_char, context) method) before either tool below
+# is usable; execute_tool_call's existing try/except turns the
+# RuntimeError otherwise raised into a normal "ERROR: ..." tool result,
+# so a run that forgets to load the proxy degrades gracefully instead of
+# crashing the whole agent loop. GPU-sharing with the search-tier
+# ensemble/agent backbone (the release_gpu()/reacquire_gpu() dance
+# LocalReActBackbone already does) is NOT yet wired up for the proxy --
+# whoever loads it is responsible for not colliding with either, same as
+# src/verify_ghost_permute_sentence_track_a.py's own explicit load/
+# del/empty_cache lifecycle.
+
+_proxy_model = None
+
+_VS_LOGPROB_SALT = "ghost_tools.inject_vs_logprob"
+
+
+def set_proxy_model(proxy) -> None:
+    """Register a loaded proxy model (encode.ProxyModel-shaped) for
+    tool_encode_vs_logprob/tool_combine_permute. Call clear_proxy_model()
+    when done so a later run without a proxy fails loudly, not silently
+    against a stale reference."""
+    global _proxy_model
+    _proxy_model = proxy
+
+
+def clear_proxy_model() -> None:
+    global _proxy_model
+    _proxy_model = None
+
+
+def _inject_vs_logprob(text, payload, threshold_tau, skip):
+    """
+    Shared logprob-guided VS-injection core for tool_encode_vs_logprob()
+    and tool_combine_permute() -- mirrors _inject_vs()'s structure
+    exactly, but each character's injection depth is now ADAPTIVE (driven
+    by a real proxy-model logprob check via
+    encode.encode_char_with_vs_logprob) instead of fixed by payload
+    length. `payload` still seeds the per-character derived byte stream
+    the same way _inject_vs's payload does -- a different payload string
+    still gives a different (but reproducible) encoding -- it just no
+    longer controls HOW MANY VS characters get appended per character;
+    that's now whatever the real model's logprob trajectory demands, up
+    to encode_char_with_vs_logprob's own 64-iteration safety cap.
+    """
+    if _proxy_model is None:
+        raise RuntimeError(
+            "no proxy model loaded -- call ghost_tools.set_proxy_model() "
+            "with a loaded encode.ProxyModel before using this tool"
+        )
+    from encode import encode_char_with_vs_logprob
+
+    result = []
+    char_index = 0
+    for char in text:
+        if char in skip or ord(char) in VS_ALL:
+            result.append(char)
+            continue
+        char_bytes = derive_payload_bytes(
+            payload, _VS_LOGPROB_SALT, char_index, n_bytes=64,
+        )
+        encoded_char, _iters = encode_char_with_vs_logprob(
+            char, char_bytes, _proxy_model, threshold_tau,
+        )
+        result.append(encoded_char)
+        char_index += 1
+    return ''.join(result)
+
+
+def tool_bidi_permute(text: str, trials: int = 2000, seed: int = 0) -> str:
+    """
+    Search for a separable permutation of text maximally displaced (by
+    Hamming distance) from the original, subject to round-trip
+    correctness, then encode it via nested bidi isolates/overrides.
+
+    This is src/bidi_permute.py's real searched mechanism -- strictly
+    stronger than manually guessing a tool_encode_bidi config, since it
+    tries `trials` random candidates and keeps the best one that still
+    renders back to the original text. No proxy model needed (pure
+    search + a real bidi-rendering check), so this tool is always
+    available, unlike the two below.
+
+    Args:
+        text: the text to permute (field value or whole sentence)
+        trials: number of random candidate permutations to try (more =
+                better chance of a highly-displaced result, at more
+                compute cost). 2000 is a reasonable default; the
+                production pipeline uses 500 for cost reasons.
+        seed: seeds the random search. `trials` only samples a fraction
+              of the full permutation space, so the starting seed can
+              matter as much as the trial budget -- if a search comes
+              back with a disappointing Hamming distance, call this
+              again with a DIFFERENT seed rather than assuming the
+              result is the best available. Defaults to 0 for
+              backward compatibility with earlier calls that didn't
+              specify one.
+
+    Returns:
+        Bidi-encoded string that renders as the original text, using
+        the best round-trip-valid permutation found. Empty string if no
+        candidate round-tripped within `trials` (rare -- see
+        bidi_permute.find_target_permutation's docstring).
+    """
+    from bidi_permute import decompose, encode as _bidi_permute_encode, find_target_permutation
+
+    _dist, perm = find_target_permutation(text, trials=trials, seed=seed)
+    if perm is None:
+        return ""
+    tree = decompose(tuple(perm))
+    return _bidi_permute_encode(tree, text)
+
+
+def tool_encode_vs_logprob(text: str, payload: str, threshold_tau: float) -> str:
+    """
+    Inject Variation Selector characters into text, with each
+    character's injection depth chosen ADAPTIVELY by querying a real
+    proxy model's logprob for the true character after each VS byte
+    appended -- stopping once that logprob drops below threshold_tau (or
+    a 64-iteration safety cap). This is src/encode.py's actual
+    production VS mechanism (what the paper's `ghost`/`ghost_permute`
+    conditions measure), not the fixed-length approximation
+    tool_encode_vs provides.
+
+    REQUIRES set_proxy_model() to have been called first -- raises if
+    not (caught by execute_tool_call, surfaced as a normal tool error).
+
+    Args:
+        text: the text to inject VS chars into
+        payload: seeds the per-character derived byte stream (same role
+                 as tool_encode_vs's payload) -- does NOT control how
+                 many VS characters get appended anymore; that's now
+                 adaptive per character.
+        threshold_tau: stop injecting once the proxy's logprob for the
+                 true character drops to or below this value (more
+                 negative = harder to satisfy = more VS characters
+                 typically needed). The calibrated production value is
+                 -8.0 (config.yaml's threshold_tau).
+
+    Returns:
+        The text with adaptively-injected VS characters. Renders
+        identically to the original for human readers.
+    """
+    return _inject_vs_logprob(
+        text, payload, threshold_tau, skip={' ', '\n', '\t', '\r'},
+    )
+
+
+def tool_combine_permute(text: str, trials: int, payload: str,
+                          threshold_tau: float, seed: int = 0) -> str:
+    """
+    Apply BOTH the searched separable-permutation bidi mechanism
+    (tool_bidi_permute) AND real logprob-guided VS injection
+    (tool_encode_vs_logprob) -- the strongest available combination,
+    matching src/encode.py's production encode_ghost_permute/
+    encode_ghost_permute_sentence mechanism, instead of `combine`'s
+    manually-specified config + fixed-length payload.
+
+    REQUIRES set_proxy_model() to have been called first.
+
+    Order of operations (same rule as `combine`): bidi permutation is
+    applied FIRST to establish the stored sequence, THEN VS injection
+    runs on that already-permuted sequence (skipping bidi control
+    characters) -- never the other way around.
+
+    Args:
+        text: original text to encode
+        trials: passed to tool_bidi_permute
+        payload: seeds the per-character derived VS byte streams (see
+                 tool_encode_vs_logprob)
+        threshold_tau: logprob stopping threshold (see
+                 tool_encode_vs_logprob)
+        seed: passed to tool_bidi_permute -- try a different seed if a
+              previous attempt's Hamming distance was disappointing for
+              this trial budget.
+
+    Returns:
+        Fully searched-permutation + logprob-guided-VS encoded string,
+        or empty string if the permutation search found no round-trip-
+        valid candidate.
+    """
+    bidi_encoded = tool_bidi_permute(text, trials=trials, seed=seed)
+    if not bidi_encoded:
+        return ""
+    skip = ALL_CTRL | {' ', '\n', '\t', '\r'}
+    return _inject_vs_logprob(bidi_encoded, payload, threshold_tau, skip=skip)
+
+
+_wider_context = None
+
+
+def set_wider_context(text) -> None:
+    """Register a wider text (e.g. the full sentence containing the
+    current field) that tool_widen_scope() can hand to the agent when
+    its current target isn't defensible on its own. Caller-owned, same
+    registration pattern as set_proxy_model() -- call clear_wider_context()
+    when the run ends so a later run without one fails loudly, not
+    silently against a stale reference."""
+    global _wider_context
+    _wider_context = text
+
+
+def clear_wider_context() -> None:
+    global _wider_context
+    _wider_context = None
+
+
+def tool_widen_scope() -> str:
+    """
+    Request a WIDER piece of text to obfuscate than your current target
+    (e.g. the full sentence containing the field, instead of just the
+    field's bare value) -- for when your best attempt on the current
+    target still can't clear a full-consensus margin against the panel.
+
+    Only use this AFTER at least one combine_permute/combine attempt,
+    including a seed retry, has already failed to reach full consensus
+    on the current target -- widening trades a much larger encoded
+    payload for more obfuscation surface, it is not a free first move.
+
+    Returns the wider text if the caller supplied one for this run, or
+    an ERROR string if none is available (in which case keep working
+    with the current target -- widening isn't possible this run).
+
+    IMPORTANT: after calling this, build your next attempt by calling
+    combine_permute/combine on the TEXT THIS TOOL RETURNS, not on your
+    original target -- and report that new encoding as your
+    <final_encoding>.
+    """
+    if _wider_context is None:
+        return (
+            "ERROR: no wider context available for this field -- "
+            "keep working with the current target"
+        )
+    return _wider_context
+
+
 def tool_combine(text: str,
                   bidi_config: str,
                   vs_payload: str) -> str:
@@ -324,4 +573,8 @@ TOOL_FUNCTIONS = {
     "encode_vs": tool_encode_vs,
     "encode_bidi": tool_encode_bidi,
     "combine": tool_combine,
+    "bidi_permute": tool_bidi_permute,
+    "encode_vs_logprob": tool_encode_vs_logprob,
+    "combine_permute": tool_combine_permute,
+    "widen_scope": tool_widen_scope,
 }

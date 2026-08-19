@@ -3,9 +3,9 @@
 #SBATCH --ntasks=1
 #SBATCH --cpus-per-task=8
 #SBATCH --mem=60G
-#SBATCH --gres=gpu:A100:1
-#SBATCH --time=03:45:00
-#SBATCH --partition=gpu-a100-short
+#SBATCH --gres=gpu:H100:1
+#SBATCH --time=12:00:00
+#SBATCH --partition=gpu-h100
 #SBATCH --signal=B:USR1@180
 #SBATCH --output=logs/track_a_full_%j.log
 

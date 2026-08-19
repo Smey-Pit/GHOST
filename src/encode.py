@@ -397,6 +397,48 @@ def encode_ghost_permute(item, proxy, seed, salt, threshold_tau, stats, trials):
     return _apply_field_transform(item, transform)
 
 
+def encode_ghost_permute_sentence(item, proxy, seed, salt, threshold_tau, stats, trials, char_spans=None):
+    """
+    Sentence-scope variant of encode_ghost_permute: combines
+    encode_bidi_permute_sentence's sentence-scope permutation search
+    with encode_ghost_permute's logprob-guided per-character VS
+    injection, applied in STORED (permuted) order over the whole
+    sentence -- this is the "ghost_permute_sentence" condition CLAUDE.md
+    flags as explicitly deferred (VS injection at sentence scope was the
+    second new scaling problem after bidi_permute_sentence's own
+    round-trip-correctness fix). Not yet added to config.yaml's
+    encoding_conditions or run at corpus scale -- first exercised as a
+    single real end-to-end check via src/verify_bidi_permute_track_a.py.
+
+    char_spans: same meaning as encode_bidi_permute_sentence's param.
+    """
+    def transform(sentence_text):
+        sentence_seed = _derive_int_seed(
+            seed, salt, "ghost_permute_sentence", item["id"], sentence_text,
+        )
+        _, perm = find_target_permutation(sentence_text, trials=trials, seed=sentence_seed)
+        if perm is None:
+            raise RuntimeError(
+                f"find_target_permutation found no round-tripping "
+                f"permutation for sentence={sentence_text!r} within "
+                f"{trials} trials"
+            )
+        tree = decompose(tuple(perm))
+        chars_by_original_pos = [None] * len(sentence_text)
+        for orig_pos in perm:
+            payload_bytes = derive_payload_bytes(
+                seed, salt, "ghost_permute_sentence", item["id"],
+                sentence_text, orig_pos,
+            )
+            vs_char, iters = encode_char_with_vs_logprob(
+                sentence_text[orig_pos], payload_bytes, proxy, threshold_tau
+            )
+            chars_by_original_pos[orig_pos] = vs_char
+            stats.append(iters)
+        return bidi_permute_encode(tree, chars_by_original_pos)
+    return _apply_sentence_transform(item, transform, char_spans=char_spans)
+
+
 def encode_ghost_nfkc(ghost_item):
     return {**ghost_item, "text": apply_nfkc(ghost_item["text"])}
 

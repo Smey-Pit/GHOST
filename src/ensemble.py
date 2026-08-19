@@ -107,6 +107,7 @@ def run_ensemble_query(
     unloader: Callable = unload_local_model,
     querier: Callable = query_adversary_local,
     checker: Callable = check_extraction,
+    frontier_check_fn: Optional[Callable] = None,
 ) -> dict:
     """
     Run one field's encoded_text through every ensemble member, one at a
@@ -144,13 +145,39 @@ def run_ensemble_query(
                  PROMPT) + check_reconstruction without duplicating the
                  load/unload/floor-check lifecycle. Real field-extraction
                  callers use the defaults.
+        frontier_check_fn: CALIBRATION-ONLY gate, None by default (every
+                 real per-document/per-field eval run must leave this
+                 unset). When given, a real frontier API model (see
+                 src/calibrate_agent_search.py's make_frontier_check_fn)
+                 is consulted, but ONLY on attempts the cheap local
+                 ensemble already calls "defended" -- this is what lets
+                 an agent's search loop learn to escalate PAST a
+                 local-ensemble pass when a stronger held-out check would
+                 still extract it, without spending an API call on every
+                 iteration. This must never be wired into the actual
+                 per-document GHOST-Agent search used for reported
+                 results: doing so would mean the reported search
+                 "succeeded" against the exact model whose defeat is
+                 later claimed as a transferability result -- the same
+                 proxy-grading-its-own-homework risk this file's module
+                 docstring already flags for the search tier itself.
+                 Use it only against the disjoint data/raw/calibration.json
+                 split, to learn better STOPPING heuristics (e.g. "require
+                 a margin past first local-ensemble pass") that then get
+                 applied blind (frontier_check_fn=None again) on the real
+                 eval set.
 
     Returns:
         dict with keys:
-          defended: bool — did >= consensus_threshold valid members fail?
+          defended: bool — did >= consensus_threshold valid members fail,
+                    AND (if frontier_check_fn was given and triggered)
+                    did that frontier check also fail to extract?
           n_valid: int — members that passed the clean-floor check
           n_failed: int — valid members that did not extract correctly
-          per_member: list of per-member result dicts
+          per_member: list of per-member result dicts (includes the
+                    frontier check, clearly labeled, when it ran)
+          frontier_check: the frontier_check_fn result dict, only present
+                    if it was actually called this attempt
     """
     if clean_floor_check and (
         clean_reference_text is None or clean_reference_value is None
@@ -199,10 +226,31 @@ def run_ensemble_query(
     valid_members = [m for m in per_member if m["valid"]]
     n_valid = len(valid_members)
     n_failed = sum(1 for m in valid_members if not m["extracted"])
+    local_defended = n_failed >= consensus_threshold
 
-    return {
-        "defended": n_failed >= consensus_threshold,
+    result = {
+        "defended": local_defended,
         "n_valid": n_valid,
         "n_failed": n_failed,
         "per_member": per_member,
     }
+
+    # Calibration-only escalation gate -- see docstring. Only spend a real
+    # API call once the cheap tier already thinks it's won; if the local
+    # ensemble hasn't converged yet there is nothing to escalate past.
+    if local_defended and frontier_check_fn is not None:
+        frontier_result = frontier_check_fn(encoded_text, field_name, ground_truth)
+        result["frontier_check"] = frontier_result
+        result["per_member"] = per_member + [{
+            "name": f"{frontier_result['name']} [CALIBRATION-ONLY frontier gate]",
+            "hf_id": None,
+            "valid": True,
+            "floor_check": None,
+            "extracted": frontier_result["extracted"],
+            "refusal": frontier_result["refusal"],
+            "response": frontier_result["response"],
+        }]
+        if frontier_result["extracted"]:
+            result["defended"] = False
+
+    return result
