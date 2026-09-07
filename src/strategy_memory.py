@@ -27,6 +27,9 @@ The strategy_memory.json structure:
       "has_numbers": false,
       "complexity": "high",
       "principle": "For multi-sentence high-complexity text...",
+      "prior_strength_ratio": 0.73,  # None if never scored (see
+          # src/prior_strength.py) -- set once at creation, not updated
+          # on strengthen (see add_principle's docstring)
       "supporting_evidence": 3,  # times this worked
       "confidence": "medium",    # low/medium/high
       "first_seen": "2026-08-11T...",
@@ -127,6 +130,7 @@ def add_principle(
     vs_payload: str,
     n_iterations: int,
     adversary_model: str,
+    prior_strength_ratio: "float | None" = None,
 ) -> dict:
     """
     Add a new principle or strengthen an existing one.
@@ -134,6 +138,17 @@ def add_principle(
     If a principle with matching profile already exists, increment its
     supporting_evidence counter and upgrade confidence if warranted.
     Otherwise create a new principle entry.
+
+    prior_strength_ratio: content_profile's "prior_strength_ratio" (see
+        src/prior_strength.py), if it was computed this run -- None
+        otherwise (every pre-existing caller that never passes
+        prior_strength_fn to run_ghost_agent). Recorded only at CREATION
+        time, same treatment as content_type/n_chars_range -- an
+        existing principle's stored value is not overwritten on
+        strengthen, since a principle already represents one profile
+        bucket and the per-attempt values belong in
+        results/experience_log.jsonl for real correlation analysis, not
+        as a running average here.
     """
     n_chars = content_profile.get("n_chars", 0)
 
@@ -163,6 +178,7 @@ def add_principle(
         "vs_payload": vs_payload,
         "n_iterations": n_iterations,
         "adversary_model": adversary_model,
+        "prior_strength_ratio": prior_strength_ratio,
         "supporting_evidence": 1,
         "confidence": "low",
         "first_seen": datetime.now().isoformat(),

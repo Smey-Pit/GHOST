@@ -49,6 +49,7 @@ from ghost_agent_prompt import (  # noqa: E402
 from ensemble import run_ensemble_query  # noqa: E402
 from reflection import ReflectionMemory, Attempt  # noqa: E402
 from ghost_tools_structural import tool_analyse_structure  # noqa: E402
+from adversary import REFUSAL_PHRASES  # noqa: E402
 import strategy_memory  # noqa: E402
 import agent_backbone as _agent_backbone_mod  # noqa: E402
 from agent_backbone import (  # noqa: E402
@@ -114,6 +115,38 @@ def distil_principle(success_data: dict, backbone) -> str:
     )
 
 
+_MIN_PRINCIPLE_LENGTH = 20
+
+
+def _is_valid_principle(text: Optional[str]) -> bool:
+    """
+    Reject distil_principle output that isn't actually a usable
+    principle before it ever reaches strategy_memory.add_principle.
+
+    Real bug found 2026-08-19: distil_principle's return value was
+    treated as valid the moment it was a non-empty string -- on 2/10
+    real examples the distillation call itself refused ("I can't help
+    with this request.") or apologized instead of producing a
+    principle, and `if principle:` let a plain refusal string through
+    to be persisted into results/strategy_memory.json as if it were
+    real learned strategy (confirmed directly by reading the file after
+    that run). Reuses adversary.REFUSAL_PHRASES -- the same substring
+    list already used to detect a refusal from an ADVERSARY response,
+    since a distillation-call refusal reads the same way. Also rejects
+    a degenerate too-short result, which a genuine principle (a
+    template-filled sentence or two) should never be.
+    """
+    if not text:
+        return False
+    stripped = text.strip()
+    if len(stripped) < _MIN_PRINCIPLE_LENGTH:
+        return False
+    lower = stripped.lower()
+    if any(p in lower for p in REFUSAL_PHRASES):
+        return False
+    return True
+
+
 # TOOL_DEFINITIONS, execute_tool_call, and run_agent_turn now live in
 # agent_backbone.py (imported above) -- re-exported here unchanged so
 # existing direct imports (e.g. smoke_test_task5.py's
@@ -171,6 +204,8 @@ def run_ghost_agent(
     proxy=None,
     wider_context: Optional[str] = None,
     require_unanimous: bool = False,
+    prior_strength_fn: Optional[Callable] = None,
+    min_sentence_scope_hamming_fraction: float = 0.3,
 ) -> dict:
     """
     Run the GHOST self-improving agent on a single field value.
@@ -284,6 +319,35 @@ def run_ghost_agent(
             loop keeps going and the per-iteration result message tells
             the agent its margin is thin -- this is what actually gives
             widen_scope()/seed-retry a reason to fire.
+        prior_strength_fn: optional (target, context) -> dict callable,
+            e.g. functools.partial(ensemble.run_ensemble_prior_strength,
+            members=ensemble_members, loader=..., unloader=...) -- same
+            "caller pre-binds everything except the two real arguments"
+            convention as frontier_check_fn. None (default) skips prior-
+            strength scoring entirely -- zero cost, zero behavior change
+            for every existing caller. When given, called ONCE before
+            the loop (it characterizes the raw target's content, not
+            any particular encoding attempt -- see src/prior_strength.py)
+            and merged into content_profile as "prior_strength_ratio"/
+            "prior_strength_detail", which then flows into the
+            experience log and any principle distilled from a successful
+            attempt. A real error here (e.g. a member fails to load) is
+            caught and logged, not raised -- this is a research signal,
+            not something that should crash a field's search.
+        min_sentence_scope_hamming_fraction: only enforced when
+            field_ground_truth is given (sentence scope) -- an attempt
+            whose Hamming distance is below this fraction of
+            len(effective_target) is rejected and retried (no Attempt
+            recorded), same treatment as a proposed encoding that fails
+            to parse. Catches a real failure mode found 2026-08-19: the
+            agent satisfying "render back to the full target" by
+            copying the entire surrounding sentence as exact verbatim
+            plaintext and only obfuscating the field itself -- field-
+            scope wearing sentence-scope's clothing. Default 0.3 sits
+            well below every genuine sentence-scope attempt observed so
+            far (92-100%) and well above the two real bugged cases found
+            (8-9%). Ignored entirely for bare-field-scope calls
+            (field_ground_truth=None) -- zero behavior change there.
 
     Returns:
         dict with keys:
@@ -334,6 +398,8 @@ def run_ghost_agent(
             frontier_check_fn=frontier_check_fn,
             wider_context=wider_context,
             require_unanimous=require_unanimous,
+            prior_strength_fn=prior_strength_fn,
+            min_sentence_scope_hamming_fraction=min_sentence_scope_hamming_fraction,
         )
     finally:
         if owns_backbone:
@@ -362,12 +428,31 @@ def _run_ghost_agent_loop(
     frontier_check_fn: Optional[Callable] = None,
     wider_context: Optional[str] = None,
     require_unanimous: bool = False,
+    prior_strength_fn: Optional[Callable] = None,
+    min_sentence_scope_hamming_fraction: float = 0.3,
 ) -> dict:
     """The actual iteration loop, split out of run_ghost_agent so backbone
     construction/reset/close (which differ between the default-Anthropic
     back-compat path and an externally-supplied/named backbone) stay in
     one place, wrapped in a single try/finally."""
     content_profile = tool_analyse_structure(target)
+
+    if prior_strength_fn is not None:
+        try:
+            prior_strength_result = prior_strength_fn(target, f"{field_name}: ")
+            content_profile = {
+                **content_profile,
+                "prior_strength_ratio": prior_strength_result["mean_ratio"],
+                "prior_strength_detail": prior_strength_result,
+            }
+            if verbose:
+                print(
+                    "Prior-strength ratio (ensemble mean): "
+                    f"{prior_strength_result['mean_ratio']:.4f}"
+                )
+        except Exception as e:
+            if verbose:
+                print(f"Prior-strength scoring failed (continuing without it): {e}")
 
     system_prompt = GHOST_AGENT_SYSTEM_PROMPT
     n_principles_available = 0
@@ -506,6 +591,61 @@ def _run_ghost_agent_loop(
             print(f"Stored sequence: '{stored}'")
             print(f"Hamming distance: {dist}")
 
+        # Real bugs found 2026-08-19 (a real sentence-scope batch run):
+        # nothing here previously checked that the proposed encoding
+        # actually covers the FULL target. Two ways that went wrong,
+        # both now rejected outright (no Attempt recorded, same
+        # silent-retry treatment as `proposed is None` above -- max_
+        # iterations bounds how many times this can happen):
+        #   1. rendered != effective_target -- either a straight length
+        #      mismatch (the agent encoded only a substring, e.g. the
+        #      bare field inside a sentence-scope target -- tool_hamming
+        #      then returns -1, which never exceeds best_hamming's
+        #      initial 0, so this used to silently "succeed" with a
+        #      nonsensical hamming=0 once the ensemble failed to read a
+        #      short, context-free garbled fragment), OR a same-LENGTH
+        #      but content-corrupted render (found independently by
+        #      verify_prior_strength_frontier.py's own round-trip check
+        #      on a real multi-line tabular document -- root cause not
+        #      yet isolated, but rendered != target catches it either way).
+        #   2. is_sentence_scope and the displacement is far too small to
+        #      be a genuine sentence-scope attempt -- e.g. the agent
+        #      copies the ENTIRE surrounding sentence as exact verbatim
+        #      plaintext and only obfuscates the field itself. This
+        #      passes check #1 (rendered == target, lengths trivially
+        #      match) and produces a small but non-zero Hamming distance
+        #      that looks superficially like "weak but valid" obfuscation
+        #      -- two real cases showed dist=12 against a ~140-char
+        #      sentence (8-9%), against 92-100% for every genuine
+        #      sentence-scope attempt in the same batch. This is field-
+        #      scope wearing sentence-scope's clothing, not a real test
+        #      of the mechanism this run/caller asked for.
+        if rendered != effective_target:
+            if verbose:
+                print(
+                    f"REJECTED: proposed encoding renders as {len(rendered)} "
+                    f"chars, target is {len(effective_target)} chars, or "
+                    f"content differs despite matching length -- it does not "
+                    f"render back to the exact full target. Retrying."
+                )
+            continue
+
+        if (
+            is_sentence_scope
+            and effective_target
+            and dist / len(effective_target) < min_sentence_scope_hamming_fraction
+        ):
+            if verbose:
+                print(
+                    f"REJECTED: only {dist}/{len(effective_target)} characters "
+                    f"({dist / len(effective_target):.1%}) displaced -- below "
+                    f"min_sentence_scope_hamming_fraction="
+                    f"{min_sentence_scope_hamming_fraction:.0%}. Sentence scope "
+                    f"requires obfuscating the surrounding text too, not just "
+                    f"the field. Retrying."
+                )
+            continue
+
         if dist > best_hamming:
             best_hamming = dist
             best_encoding = proposed
@@ -570,6 +710,18 @@ def _run_ghost_agent_loop(
                 "bidi_config": attempt.bidi_config,
                 "vs_payload": attempt.vs_payload,
                 "hamming_dist": dist,
+                # Structured, per-attempt fields for later correlation
+                # analysis (e.g. "does prior_strength_ratio predict
+                # hamming_pct/frontier_outcome") -- see CLAUDE.md's
+                # prior-strength scoping discussion. prior_strength_ratio
+                # is None when prior_strength_fn wasn't given this run;
+                # vs_threshold_tau is not yet captured from tool calls
+                # (extract_config_from_tool_calls doesn't record it) --
+                # a known gap, not silently pretended away.
+                "prior_strength_ratio": content_profile.get("prior_strength_ratio"),
+                "hamming_pct": (dist / len(effective_target)) if effective_target else None,
+                "vs_threshold_tau": None,
+                "frontier_outcome": ensemble_result.get("frontier_check"),
                 "adversary_model": [m["name"] for m in ensemble_members],
                 "adversary_response": [
                     m.get("response") for m in ensemble_result["per_member"]
@@ -662,6 +814,14 @@ def _run_ghost_agent_loop(
                         print(f"Principle distillation failed: {e}")
                     principle = None
 
+                if principle is not None and not _is_valid_principle(principle):
+                    if verbose:
+                        print(
+                            f"Distillation produced no usable principle "
+                            f"(refusal or too short) -- discarding: {principle!r}"
+                        )
+                    principle = None
+
                 if principle:
                     # NOTE: n_documents_processed is deliberately NOT
                     # touched here. run_ghost_agent operates per FIELD,
@@ -685,6 +845,16 @@ def _run_ghost_agent_loop(
                         adversary_model=",".join(
                             m["name"] for m in ensemble_members
                         ),
+                        # Deliberately content_profile (the ORIGINAL
+                        # target's score), not final_content_profile --
+                        # prior-strength was only ever computed once, on
+                        # `target`, before any widen_scope() call.
+                        # Re-scoring the widened target would need
+                        # another real ensemble load/unload pass, not
+                        # done here; this value should be read as "the
+                        # pre-widen field's prior strength" whenever
+                        # scope_widened is True, not the sentence's.
+                        prior_strength_ratio=content_profile.get("prior_strength_ratio"),
                     )
                     strategy_memory.save_memory(loaded_memory)
                     if verbose:

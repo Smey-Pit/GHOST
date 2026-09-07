@@ -210,7 +210,7 @@ with tempfile.TemporaryDirectory() as tmpdir:
         output_dir=output_dir,
         n_fields=3,
         max_iterations=5,
-        frontier_model_key="gpt56_sol",
+        frontier_model_keys=["gpt56_sol"],
         run_ghost_agent_fn=_fake_run_ghost_agent_fn,
     )
 

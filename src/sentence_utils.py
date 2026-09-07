@@ -32,7 +32,22 @@ import re
 # This sidesteps needing digit-adjacency lookarounds entirely -- verified
 # directly against both real generators' value shapes in
 # smoke_test_sentence_utils.py.
-_SENTENCE_BOUNDARY_RE = re.compile(r'(?<=[.!?])\s+')
+#
+# ALSO split on any run of newlines, independent of preceding punctuation
+# (real bug found 2026-08-19: on tabular/semi-structured Track A documents
+# like "Docket Number: DK-2023-12345\nCase Filing Number: ...\n..." with
+# no sentence-ending punctuation anywhere nearby -- or in one real case,
+# anywhere in the ENTIRE document except its final line -- the old regex
+# never found a boundary near the field at all, so find_field_sentence
+# returned the whole multi-hundred-character document as "the sentence."
+# A tabular key:value line is a natural, human-perceived unit on its own,
+# same as a real sentence is -- splitting on newlines treats it as one.
+# Confirmed harmless for the two existing supported shapes: data/raw/
+# documents.json's text has no newlines at all (space-joined sentences),
+# and the real Track A prose doc smoke_test_sentence_utils.py's
+# multi-field-one-sentence case depends on (regfiling_0000, pilot split)
+# is a single unbroken paragraph with no newlines either.
+_SENTENCE_BOUNDARY_RE = re.compile(r'(?<=[.!?])\s+|\n+')
 
 
 def split_sentences_with_spans(text):

@@ -55,9 +55,37 @@ import yaml
 sys.path.insert(0, os.path.dirname(__file__))
 from ghost_agent import run_ghost_agent  # noqa: E402
 from ensemble import load_ensemble_config  # noqa: E402
-from adversary import make_frontier_check_fn  # noqa: E402
+from adversary import make_frontier_check_fn, make_multi_frontier_check_fn  # noqa: E402
 
 _REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def _serialize_history(result: dict) -> list:
+    """
+    Full per-iteration history including per-member breakdown (model name
+    -> valid/extracted/refusal), so a later analysis can check e.g.
+    whether the same local ensemble member is always the last to fall
+    under require_unanimous, or what specifically changed (seed, trials,
+    vs_payload, threshold_tau) between iterations that did vs. didn't
+    move the frontier verdict. Previously this was computed by
+    run_ensemble_query on every attempt and then discarded -- only the
+    aggregate n_failed/n_valid counts ever reached a saved file.
+    """
+    return [
+        {
+            "iteration": a.iteration,
+            "bidi_config": a.bidi_config,
+            "vs_payload": a.vs_payload,
+            "hamming_dist": a.hamming_dist,
+            "ensemble_defended": a.extraction_defeated,
+            "n_failed": a.n_failed,
+            "n_valid": a.n_valid,
+            "per_member": a.ensemble_result.get("per_member"),
+            "frontier_check": a.ensemble_result.get("frontier_check"),
+            "agent_reasoning": a.agent_reasoning,
+        }
+        for a in result.get("history", [])
+    ]
 
 
 def iter_calibration_fields(calibration_path: str, n_fields: int):
@@ -67,6 +95,11 @@ def iter_calibration_fields(calibration_path: str, n_fields: int):
     document) -- this script is meant to be run on a handful of fields
     before scaling up, given the real API/GPU cost per field (baseline
     run + gated run, each a full agent search).
+
+    NOTE: walks docs in file order, which is NOT domain-balanced (the 20
+    calibration docs are grouped by domain, and financial alone has ~19
+    fields) -- a small n_fields here samples only the first domain(s) it
+    reaches. Use explicit_fields (below) for a domain-balanced sample.
     """
     with open(calibration_path) as f:
         docs = json.load(f)
@@ -82,15 +115,31 @@ def iter_calibration_fields(calibration_path: str, n_fields: int):
             count += 1
 
 
+def iter_explicit_fields(calibration_path: str, doc_field_pairs: list):
+    """
+    Yield (doc_id, domain, field_name, field_value) for an explicit
+    [(doc_id, field_name), ...] list, in that order -- lets a caller pick
+    a domain-balanced (or otherwise deliberate) sample instead of the
+    doc-order walk iter_calibration_fields does.
+    """
+    with open(calibration_path) as f:
+        docs = {d["id"]: d for d in json.load(f)}
+
+    for doc_id, field_name in doc_field_pairs:
+        doc = docs[doc_id]
+        yield doc_id, doc["domain"], field_name, doc["fields"][field_name]
+
+
 def run_calibration(
     calibration_path: str = None,
     config_path: str = None,
     output_dir: str = None,
     n_fields: int = 5,
     max_iterations: int = 5,
-    frontier_model_key: str = "gpt56_sol",
+    frontier_model_keys=("gpt56_sol",),
     agent_backbone_name: str = None,
     run_ghost_agent_fn=run_ghost_agent,
+    explicit_fields: list = None,
 ) -> list:
     """
     Args:
@@ -100,11 +149,19 @@ def run_calibration(
             or any Track A file; this must stay the disjoint split.
         n_fields: total fields to run (baseline + gated each), not per
             document -- controls real cost directly.
-        frontier_model_key: key into config.yaml's api_models, e.g.
-            "gpt56_sol" (matches the user's own manual UI confirmation)
-            or "gemini_31_pro"/"claude_sonnet".
+        frontier_model_keys: iterable of keys into config.yaml's
+            api_models, e.g. ("gpt56_sol", "claude_sonnet"). More than
+            one means an AND-gate: the local ensemble's "defended"
+            verdict is only accepted if EVERY listed model also fails to
+            extract (make_multi_frontier_check_fn) -- a stricter bar than
+            gating on a single model, and less dependent on one model's
+            particular failure mode (e.g. gpt56_sol's non-determinism).
         agent_backbone_name: same meaning as convergence.py's own param
             -- None uses run_ghost_agent's default Anthropic backbone.
+        explicit_fields: optional [(doc_id, field_name), ...] list -- when
+            given, run exactly these fields via iter_explicit_fields
+            instead of the doc-order n_fields walk (see its docstring for
+            why doc-order isn't domain-balanced).
 
     Returns:
         list of per-field comparison dicts (also written to
@@ -117,16 +174,26 @@ def run_calibration(
     output_dir = output_dir or os.path.join(_REPO_ROOT, "results", "tables")
     os.makedirs(output_dir, exist_ok=True)
 
+    frontier_model_keys = list(frontier_model_keys)
+    frontier_model_label = "+".join(frontier_model_keys)
+
     with open(config_path) as f:
         config = yaml.safe_load(f)
     ensemble_config = load_ensemble_config(config)
-    frontier_check_fn = make_frontier_check_fn(frontier_model_key, config)
+    if len(frontier_model_keys) == 1:
+        frontier_check_fn = make_frontier_check_fn(frontier_model_keys[0], config)
+    else:
+        frontier_check_fn = make_multi_frontier_check_fn(frontier_model_keys, config)
 
     results = []
+    detailed_results = []
 
-    for doc_id, domain, field_name, field_value in iter_calibration_fields(
-        calibration_path, n_fields,
-    ):
+    field_iter = (
+        iter_explicit_fields(calibration_path, explicit_fields)
+        if explicit_fields is not None
+        else iter_calibration_fields(calibration_path, n_fields)
+    )
+    for doc_id, domain, field_name, field_value in field_iter:
         print(f"\n[{doc_id}/{domain}] {field_name} = '{field_value}'")
 
         print("  -- baseline (local-ensemble-only stopping) --")
@@ -143,7 +210,11 @@ def run_calibration(
             use_memory=False,  # calibration must not pollute strategy_memory.json
         )
 
-        print(f"  -- gated (also requires {frontier_model_key} to fail) --")
+        gate_desc = (
+            f"{frontier_model_label} to fail" if len(frontier_model_keys) == 1
+            else f"ALL of {frontier_model_label} to fail"
+        )
+        print(f"  -- gated (also requires {gate_desc}) --")
         gated = run_ghost_agent_fn(
             target=field_value,
             field_name=field_name,
@@ -163,7 +234,7 @@ def run_calibration(
             "domain": domain,
             "field_name": field_name,
             "field_length": len(field_value),
-            "frontier_model": frontier_model_key,
+            "frontier_model": frontier_model_label,
             "baseline_success": baseline["success"],
             "baseline_iterations": baseline["n_iterations"],
             "baseline_hamming": baseline["final_hamming"],
@@ -174,6 +245,11 @@ def run_calibration(
             "hamming_delta": gated["final_hamming"] - baseline["final_hamming"],
         }
         results.append(row)
+        detailed_results.append({
+            **row,
+            "baseline_history": _serialize_history(baseline),
+            "gated_history": _serialize_history(gated),
+        })
         print(
             f"  baseline: success={baseline['success']} "
             f"iters={baseline['n_iterations']} hamming={baseline['final_hamming']}"
@@ -191,6 +267,16 @@ def run_calibration(
             if not file_exists:
                 writer.writeheader()
             writer.writerows(results)
+
+    # Full per-iteration/per-member detail, appended (not overwritten) --
+    # the CSV above stays a clean summary; this is what a later analysis
+    # of "does the same local model always hold out" / "what changed
+    # between iterations" should read instead.
+    detail_path = os.path.join(output_dir, "agent_search_calibration_detail.jsonl")
+    os.makedirs(os.path.dirname(detail_path), exist_ok=True)
+    with open(detail_path, "a") as f:
+        for row in detailed_results:
+            f.write(json.dumps(row) + "\n")
 
     print(f"\n{'='*55}")
     print("SEARCH CALIBRATION SUMMARY")
@@ -226,7 +312,15 @@ if __name__ == "__main__":
     )
     parser.add_argument("--n_fields", type=int, default=5)
     parser.add_argument("--max_iterations", type=int, default=5)
-    parser.add_argument("--frontier_model", default="gpt56_sol")
+    parser.add_argument(
+        "--frontier_model", default="gpt56_sol",
+        help=(
+            "Comma-separated config.yaml api_models key(s), e.g. "
+            "'gpt56_sol,claude_sonnet'. More than one means an AND-gate: "
+            "the local ensemble's 'defended' verdict is only accepted if "
+            "EVERY listed model also fails to extract."
+        ),
+    )
     parser.add_argument("--agent_backbone_name", default=None)
     parser.add_argument("--calibration_path", default=None)
     parser.add_argument("--config_path", default=None)
@@ -239,6 +333,6 @@ if __name__ == "__main__":
         output_dir=args.output_dir,
         n_fields=args.n_fields,
         max_iterations=args.max_iterations,
-        frontier_model_key=args.frontier_model,
+        frontier_model_keys=[k.strip() for k in args.frontier_model.split(",")],
         agent_backbone_name=args.agent_backbone_name,
     )

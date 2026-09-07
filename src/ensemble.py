@@ -28,6 +28,7 @@ from typing import Callable, Optional
 
 sys.path.insert(0, os.path.dirname(__file__))
 from adversary import query_adversary_local, check_extraction  # noqa: E402
+from prior_strength import score_prior_strength  # noqa: E402
 
 
 # ── Model loading (real implementation; swappable for tests) ────────────
@@ -254,3 +255,78 @@ def run_ensemble_query(
             result["defended"] = False
 
     return result
+
+
+# ── Prior-strength scoring ────────────────────────────────────────────
+
+def run_ensemble_prior_strength(
+    target: str,
+    context: str,
+    members: list,
+    loader: Callable = load_local_model,
+    unloader: Callable = unload_local_model,
+    scorer: Callable = score_prior_strength,
+) -> dict:
+    """
+    Score `target`'s prior-strength profile (see src/prior_strength.py)
+    against every search-tier ensemble member, one at a time, and
+    average the ratio across them.
+
+    Computed ONCE per field on the RAW target, before any encoding --
+    this characterizes the content itself (how much of it an LLM's own
+    prior already explains, beyond generic compressibility), not any
+    particular encoding attempt. Same load-one-at-a-time-then-unload
+    lifecycle as run_ensemble_query, so cost is roughly one extra pass
+    through the ensemble's load/unload cycle per field, not per
+    iteration.
+
+    Averaging the RATIO (not raw per-token logprob) across members is
+    deliberate: the ratio is already normalized against each member's
+    own surprisal via the same tokenizer-agnostic zlib reference, so an
+    average across genuinely different tokenizer families (this
+    ensemble's whole reason for existing) is comparing like with like in
+    a way raw cross-tokenizer logprob averaging would not be.
+
+    Args:
+        target: the string being scored (e.g. a field value or sentence).
+        context: non-empty preceding text (see prior_strength._per_token_
+                 bits -- required so there's an anchor position to
+                 predict the target's first token from).
+        members: list of dicts as returned by load_ensemble_config
+                 (at least {"name", "hf_id", "dtype"}).
+        loader/unloader/scorer: dependency-injection points, same
+                 rationale as run_ensemble_query -- unit-testable
+                 without a GPU.
+
+    Returns:
+        dict with keys:
+          mean_ratio: float — average prior-strength ratio across
+                    members (near 0 = ensemble-wide familiarity/
+                    memorization; near 1 = no ensemble member has an
+                    edge over generic compression).
+          per_member: list of {"name", "hf_id", "ratio", "nll_bits",
+                    "compressed_bits", "min_k_bits"}.
+    """
+    per_member = []
+
+    for member in members:
+        tokenizer, model = loader(member["hf_id"], member.get("dtype", "bfloat16"))
+        try:
+            profile = scorer(tokenizer, model, target, context)
+            per_member.append({
+                "name": member["name"],
+                "hf_id": member["hf_id"],
+                **profile,
+            })
+        finally:
+            unloader(tokenizer, model)
+
+    mean_ratio = (
+        sum(m["ratio"] for m in per_member) / len(per_member)
+        if per_member else float("nan")
+    )
+
+    return {
+        "mean_ratio": mean_ratio,
+        "per_member": per_member,
+    }

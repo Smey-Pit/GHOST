@@ -1878,3 +1878,616 @@ one-off scratch scripts, same status as every other `verify_*.py` file);
 distilling "VS strength matters independently of Hamming" into an
 actual `strategy_memory` principle instead of leaving it as a narrative
 finding in this file.
+
+## `widen_scope()` hunt on longer real fields, and why it may be structurally unobservable on real data (2026-08-19)
+
+Direct follow-up to Real run 1 above (a 6-char field's permutation space
+was too small to exercise `require_unanimous`/`widen_scope` — floor
+effect at the "too easy" end). Hypothesis: maybe LONGER real Track A
+fields would be hard enough to force a retry or a widen.
+
+**`src/verify_widen_scope_hunt.py`** swept 5 longer fields across 4
+Track A domains (`statute_reference` 32ch, `orcid_fragment` 19ch,
+`case_filing_number` 14ch, `doi_suffix` 19ch, `ABN` 15ch), FIELD scope,
+`wider_context`=the field's sentence, `require_unanimous=True`, live
+Qwen proxy (`combine_permute` with seed retry available), Claude Haiku
+backbone, **no `frontier_check_fn`** (real Track A data — the
+calibration-only firewall applies here same as everywhere else).
+
+**Result: all 5 converged in exactly 1 iteration with full local-
+ensemble unanimity, `widen_scope()` never fired — identical floor
+effect, this time confirmed NOT explained by field length.** Full
+results: `results/raw/verify_widen_scope_hunt.json`.
+
+**The actual explanation (user's insight, confirmed by inspecting the
+run): it isn't about field difficulty at all.** This sweep, correctly,
+had no `frontier_check_fn` — real Track A data is firewalled from the
+calibration-only gate by design. But that gate is the ONLY thing that
+has ever made the local-ensemble bar hard to clear in this entire
+project (see the calibration run in the section above, where the SAME
+mechanism forced 3 real iterations). Without it, there is nothing in
+the real-data loop capable of being hard, regardless of target length
+or content. **This means `require_unanimous`/`widen_scope()` may be
+structurally near-impossible to observe firing on real eval data under
+the current protocol** — not a matter of finding the right field, but a
+consequence of the firewall that protects the transferability claim
+also removing the only source of real difficulty. Hunting for a harder
+*field* was the wrong lever; the lever that matters is whether the
+*local ensemble itself* can be made harder without a frontier model in
+the loop at all (unresolved, see below).
+
+## `require_unanimous` critique: real blind spot found, mechanism deprioritized (2026-08-19)
+
+User raised two structural objections to `require_unanimous` before any
+more real-cost runs were spent on it:
+1. If one specific local-ensemble member is consistently the "last to
+   fall," full unanimity degenerates into "defeat model X specifically"
+   — the other 3 members contribute nothing once they're cleared on
+   iteration 1, which most real runs' logs show happening.
+2. Even genuine 4-of-4 unanimity is still bounded by the local
+   ensemble's known weakness relative to frontier models (the whole
+   reason the search/verify gap exists) — unanimity can never
+   manufacture frontier-level signal out of proxies chosen for
+   tokenizer diversity, not strength.
+
+**Checked directly, found a real blind spot, not just a hypothetical
+risk:** `ensemble.run_ensemble_query` computes `per_member` (each
+member's name + valid/extracted/refusal) on every single attempt, but
+neither the verbose console print (`ghost_agent.py`, only ever printed
+the aggregate `n_failed/n_valid` count) nor ANY saved result JSON from
+any real run this whole project has ever recorded which specific member
+held out. Confirmed by grepping every `results/raw/*.json` file for
+local-ensemble member names — none appear anywhere except the frontier
+model names in one file. **So point 1 above is currently unanswerable
+from existing data — not reassuring, just unmeasured**, and it was
+unmeasured despite the information already existing in memory on every
+run, computed and then thrown away.
+
+**A compounding factor also found while checking this**: `n_valid` in
+`run_ensemble_query`'s result is not fixed at the ensemble size — the
+clean-floor check excludes any member that can't even extract from
+*unencoded* reference text, so "full unanimity" on a given field could
+mean 4-of-4 or a smaller number with weak members excluded, and that
+count was also never persisted per real run. If it's often fewer than
+4, unanimity is closer to "defeat an already-small surviving subset"
+than the headline number suggests.
+
+**Decision**: `require_unanimous` is deprioritized relative to the
+calibration-only frontier gate, which is the only mechanism in this
+project with demonstrated teeth (the real 3-iteration
+`reference_number` trace, and the VS-strength-independent-of-Hamming
+finding, both from the section above) — its ceiling is capped by the
+same local-ensemble weakness `require_unanimous` can never escape
+either way, so further investment goes toward scaling the frontier gate
+to more fields/models rather than continuing to test `require_unanimous`
+in isolation.
+
+**Per-member/per-iteration detail logging added** (so this blind spot
+doesn't recur for any future calibration run): `calibrate_agent_search.py`
+now writes a companion `agent_search_calibration_detail.jsonl` (same
+`output_dir` as the existing summary CSV) with, per iteration: `bidi_config`,
+`vs_payload`, `hamming_dist`, the full `per_member` breakdown (name +
+valid/extracted/refusal), and the frontier-gate result — sourced
+directly from `Attempt.ensemble_result`, which already carried this,
+via a new `_serialize_history()` helper. **Real bug caught while
+building this**: the first version hardcoded the detail path to the
+real `results/raw/` regardless of the test's `output_dir` override,
+so running `tests/smoke_test_search_calibration.py` (which uses a tmp
+`output_dir` for exactly this reason) silently wrote 3 rows of fake test
+data into the actual repo's `results/raw/agent_search_calibration_detail.jsonl`.
+Caught by inspecting the real directory after a test run, not by
+review. Fixed: the detail path is now derived from `output_dir`, same
+as the CSV; the polluted file was deleted.
+
+## Dual-frontier-model AND-gate + domain-balanced calibration sampling (2026-08-19)
+
+To scale the calibration-gate mechanism per the decision above, two
+extensions to the calibration machinery:
+
+**`adversary.make_multi_frontier_check_fn(model_keys, config)`** — same
+CALIBRATION-ONLY contract as the existing `make_frontier_check_fn`, but
+queries several frontier models and overturns "defended" if ANY of them
+extracts (an AND-gate: the encoding must defeat every listed model, not
+just one). Reduces dependence on any single model's particular failure
+mode — notably `gpt56_sol`'s already-documented non-determinism
+(rejects `temperature=0`), which has made several of its solo results
+non-reproducible across this project. `calibrate_agent_search.py`'s
+`frontier_model_keys` param (CLI: `--frontier_model` now accepts a
+comma-separated list, e.g. `gpt56_sol,claude_sonnet`) picks single- vs.
+multi-model gating automatically by list length.
+
+**Domain-balanced explicit field selection**: `iter_calibration_fields`'s
+plain doc-order walk is NOT domain-balanced — the 20 calibration docs
+are grouped by domain and financial alone has ~19 fields, so a small
+`n_fields` cap only ever sampled the first domain(s) reached. Added
+`iter_explicit_fields`/`run_calibration`'s new `explicit_fields` param:
+an explicit `[(doc_id, field_name), ...]` list, used instead of the
+`n_fields` walk when given.
+
+**Real dual-gate sweep launched (2026-08-19), `gpt56_sol` + `claude_sonnet`,
+`claude_haiku` agent backbone, 8 fields across all 4 calibration
+domains** (2 per domain): `cal_fin_001/reference_number`,
+`cal_fin_003/account_number`, `cal_med_001/patient_id`,
+`cal_med_003/dosage`, `cal_leg_001/case_number`, `cal_leg_002/abn`,
+`cal_tec_001/serial_number`, `cal_tec_003/port`. **Still running as of
+this writing (4/8 fields done) — treat the numbers below as partial,
+not final:**
+
+| field | baseline | gated (gpt56_sol AND claude_sonnet must both fail) |
+|---|---|---|
+| `reference_number` | success, 1 iter, hamming 10 | **FAILED to resolve within 3 iters**, hamming 10 |
+| `account_number` | success, 1 iter, hamming 8 | success, 1 iter, hamming 7 |
+| `patient_id` | success, 1 iter, hamming 6 | success, 2 iters, hamming 7 |
+| `dosage` | **FAILED, 5 iters, hamming 8** (baseline itself never converged) | failed, 4 iters, hamming 8 |
+
+Two things worth flagging even from this partial data: (1) the dual
+gate's difficulty is field-dependent, not uniform — trivial for
+`account_number`, one extra iteration for `patient_id`, and genuinely
+unresolved within budget for `reference_number`; (2) `dosage` failing
+to converge even under the plain BASELINE (no frontier gate at all,
+just the local ensemble) reproduces the self-improving audit's earlier
+finding (`GHOST_self_improving.md` real smoke test, "Honest assessment"
+section above) that `dosage` is a genuinely hard field for this
+mechanism, independent of any frontier-gate question. Full detail
+(per-iteration, per-member) will land in
+`results/tables/agent_search_calibration_detail.jsonl` once the sweep
+completes — remaining fields (`case_number`, `abn`, `serial_number`,
+`port`) not yet run at time of writing.
+
+## Prior-strength scoring: design and first implementation (2026-08-19)
+
+Motivating question (user): the whole point of GHOST-Agent's persistent
+memory is to let it learn generalizable strategy, not just re-solve each
+field cold — can it learn something like "high-semantic-prior content
+(a brand name, a memorable phrase) needs deeper Hamming/VS than a bank
+account number of similar length," the way a human red-teamer would
+intuit? Checked directly: **no** — `tool_analyse_structure` (the only
+content-profiling mechanism `strategy_memory` retrieval keys on) is
+purely structural (`content_type`/`n_chars`/`n_sentences`/`has_numbers`/
+`complexity`); nothing anywhere scores how predictable/familiar a
+string's actual content is to an LLM, independent of its shape. The
+"Prior Strength Hypothesis" section above is a real, qualitative
+finding (the reconstruction-run sentence needed far deeper VS than short
+numeric fields) but was never operationalized as a measurable per-target
+signal, and confounds length with content novelty (a long sentence vs. a
+short field differ in both dimensions at once).
+
+**First design (rejected before writing any code, on user's own
+methodological challenge): per-character average logprob across the
+search-tier ensemble.** User's objection, confirmed correct: averaging
+surprisal per character/token erases exactly the signal wanted — a
+long, memorized passage (a famous lyric) should score LOW total
+surprisal despite its length (the model already "has" it), while a
+short random account number should score HIGH despite being short (no
+prior pull toward the specific digits). A per-unit RATE conflates
+"short" with "predictable." Total (summed) surprisal is the right unit.
+
+**Second problem, also caught before coding**: raw total surprisal
+alone still conflates "genuinely familiar/memorized" with "merely
+fluent" — ordinary grammatical English is low-perplexity to an LLM
+regardless of whether any specific passage is memorized, so a long
+ordinary sentence can look deceptively low-surprisal for the wrong
+reason. User asked for a way to unify the short-opaque-ID and
+long-excerpt-memorization regimes mathematically rather than treating
+them as different cases.
+
+**Adopted design, following the training-data-extraction / membership-
+inference literature (Carlini et al., "Extracting Training Data from
+Large Language Models"; Shi et al., "Min-K% Prob"), which faces the
+identical "is this memorized, or just fluent/short?" question**:
+normalize total model surprisal against a reference COMPRESSOR, not
+against length —
+
+    ratio = model_NLL_bits(target | context) / zlib_compressed_bits(target)
+
+zlib is generic, model-agnostic, and tokenizer-agnostic (runs on raw
+UTF-8 bytes, not model tokens) — a repetitive/memorized string
+compresses well AND the model predicts it well (ratio near 0: the model
+needs far fewer bits than a generic compressor would, i.e. it already
+"knows" this beyond what's explained by compressibility alone); a
+random account number compresses poorly and the model predicts it
+poorly (ratio near 1: no edge over generic compression). This ratio is
+comparable across wildly different lengths/domains and across different
+tokenizer families — exactly the unification asked for.
+
+**Implemented (`src/prior_strength.py`, new module):**
+- `compressed_bits(text)` — the zlib reference baseline.
+- `_per_token_bits(tokenizer, model, target, context)` — teacher-forced,
+  one forward pass, generalizes `encode.py`'s existing single-character
+  `ProxyModel.query_logprob` to a multi-token continuation. Requires
+  non-empty `context` (an anchor position for the target's first
+  predicted token) — raises `ValueError` otherwise, not a silent
+  degenerate result. Documented approximation: `context` and
+  `context + target` are tokenized separately to locate the target's
+  token span, which is not always exactly separable at that boundary
+  for a real subword tokenizer (a known limitation, not fixed here).
+- `score_target_nll_bits` — total surprisal (bits) of `target` given
+  `context`.
+- `score_min_k_bits` — mean surprisal of the least-predictable k%
+  of target tokens (Shi et al.'s Min-K% idea), so a mostly-fluent
+  passage with one specific hard-to-guess token (a real date, a named
+  entity) doesn't get washed out by an all-tokens average.
+- `score_prior_strength` — the full profile dict (`nll_bits`,
+  `compressed_bits`, `ratio`, `min_k_bits`).
+
+**Verified against the actual math, not just plumbing**
+(`tests/smoke_test_prior_strength.py`, no GPU): deterministic fake
+tokenizer/model objects (a "confident" model that's near-certain on the
+true continuation everywhere, a "uniform" model with no information,
+and a "spike" model confident everywhere except one target position)
+confirm the surprisal ordering (confident ≈0 bits < uniform ≈log2(vocab)
+bits/token), the resulting ratio ordering, that `score_min_k_bits`
+correctly surfaces an isolated spike a plain mean would mostly hide, and
+the empty-context guard. All pass.
+
+**Ensemble wiring (`src/ensemble.py`)**: `run_ensemble_prior_strength`
+— same load-one-at-a-time-then-unload lifecycle as `run_ensemble_query`,
+scores each of the 4 search-tier members via `score_prior_strength`,
+averages the RATIO (not raw per-token logprob) across them — the ratio
+is already tokenizer-normalized via the shared zlib baseline, so
+averaging it across genuinely different tokenizer families (this
+ensemble's whole reason for existing) compares like with like in a way
+raw cross-tokenizer logprob averaging would not. Verified via DI
+(`tests/smoke_test_ensemble_prior_strength.py`, fake loader/unloader/
+scorer): correct averaging, per-member key completeness, strict
+load→unload→next-load ordering, graceful handling of an empty member
+list. All pass; pre-existing `smoke_test_ensemble.py` unaffected.
+
+**Agent/memory wiring (`src/ghost_agent.py`, `src/strategy_memory.py`)**:
+`run_ghost_agent`/`_run_ghost_agent_loop` gained `prior_strength_fn:
+Optional[Callable] = None` — same "caller pre-binds everything, `None`
+is a complete no-op" convention as `frontier_check_fn`. When given,
+called ONCE before the loop on the raw `target` (context =
+`f"{field_name}: "`, a documented simplification — the real preceding
+document text isn't reconstructed here), merged into
+`content_profile["prior_strength_ratio"]`/`["prior_strength_detail"]`,
+wrapped in try/except so a real failure (e.g. a member fails to load)
+degrades gracefully rather than crashing the field's search.
+`append_experience`'s per-iteration record now carries
+`prior_strength_ratio`, `hamming_pct`, and `frontier_outcome` (plus a
+`vs_threshold_tau: None` placeholder — `extract_config_from_tool_calls`
+doesn't capture the VS threshold actually used yet, a known gap, not
+silently pretended away). `strategy_memory.add_principle` gained
+`prior_strength_ratio`, stored ONCE at principle creation and
+deliberately never overwritten on strengthen (same immutable-after-
+creation treatment as `content_type`/`n_chars_range`) — the per-attempt
+values for real correlation analysis belong in
+`results/experience_log.jsonl`, not as a running average on the
+compact principle summary. When `scope_widened` is True, this records
+the ORIGINAL (pre-widen) target's score, not the widened sentence's —
+re-scoring after a widen would need another real ensemble load/unload
+pass, not done.
+
+Verified end-to-end with a fake `prior_strength_fn`
+(`tests/smoke_test_ghost_agent_prior_strength.py`): called exactly once
+with `(target, "field_name: ")`, its result reaches the verbose log via
+the `content_profile` merge; `prior_strength_fn=None` is a byte-for-byte
+no-op (no call, no log line, identical outcome); a raising
+`prior_strength_fn` is caught and logged, the run still succeeds. Full
+regression sweep of every pre-existing smoke test suite (`smoke_test_task5`,
+`smoke_test_ensemble`, `smoke_test_agent_backbone`, `smoke_test_task6`,
+`smoke_test_search_calibration`) passed after all of the above.
+
+**Not yet done** (this was scoping + plumbing, not the actual finding):
+the real validation experiment — 3-4 length-matched triplets (a
+well-known brand/name vs. an invented same-length pseudo-word vs. a
+random same-length alphanumeric string) run through the calibration-
+gated loop, checking whether `mean_ratio` actually correlates with
+iterations-needed / final Hamming-VS-depth once both gates are
+satisfied. No real (non-mocked) run of `run_ensemble_prior_strength`
+or `prior_strength_fn` wiring exists yet — everything above is
+verified against fakes only. `distil_principle`'s prompt template
+doesn't yet reference `prior_strength_ratio` (the value is stored
+structurally but not yet fed into the agent's own principle-writing
+reasoning). `vs_threshold_tau` capture from tool calls still missing.
+
+## Field-level dual-gate sweep killed, and a real batch-persistence gap found (2026-08-19)
+
+Direct follow-up to the dual-frontier-model AND-gate sweep above: after
+seeing partial results (5/8 fields — `reference_number`/`case_number`
+failing to resolve within budget under the dual gate, `dosage` failing
+even at plain baseline), the user judged field-level scope insufficient
+to keep investing calibration time in and had the sweep killed.
+
+**Real gap found in the process, not hypothetical**: `calibrate_agent_search.py`
+writes its summary CSV and detail JSONL only ONCE, after the entire
+field loop completes — so killing the process mid-sweep lost all 5
+completed fields' structured data. The numbers only survive as text in
+`logs/dual_gate_calibration.log`, not in any queryable file. **Not yet
+fixed** — a batch script that only persists at the very end is one
+`kill`/crash away from losing everything; should write incrementally
+(one row per field, as it completes) instead.
+
+## Real sentence-scope prior-strength run (10 examples, Track A) — first non-mocked exercise of the whole chain, and it found five real bugs (2026-08-19)
+
+Direct follow-up to "field-level is not enough": ran `src/verify_prior_strength_learning.py`,
+10 real Track A examples across all 4 domains, SENTENCE scope (target =
+the field's containing sentence, `field_ground_truth` = the bare field
+value), `use_memory=True` (real `strategy_memory.json`/
+`experience_log.jsonl` writes, intentionally — the question is whether
+real persistent memory + the new prior-strength signal show ANY
+learning signal), live Qwen proxy, `claude_haiku` backbone, no
+`frontier_check_fn` (real eval data). This is the first real,
+non-mocked exercise of the entire `prior_strength.py` → `ensemble.py` →
+`ghost_agent.py` → `strategy_memory.py` chain — everything before this
+was verified against fakes only.
+
+**Local-tier summary (all 10):**
+
+| item | prior_ratio | local success | iters | hamming% |
+|---|---|---|---|---|
+| `regfiling_0000/jurisdiction_code` | 0.135 | True | 1 | 92.0% |
+| `regfiling_0000/ABN` | 0.107 | True | 1 | 8.5% |
+| `regfiling_0001/company_type` | 0.178 | True | 1 | 0.0% |
+| `regfiling_0003/jurisdiction_code` | 0.108 | **False** | 4 | 92.8% |
+| `legalrec_0000/case_filing_number` | 0.159 | True | 1 | 93.8% |
+| `legalrec_0002/statute_reference` | 0.147 | True | 1 | 0.0% |
+| `acadid_0000/orcid_fragment` | 0.117 | True | 1 | 95.5% |
+| `acadid_0001/doi_suffix` | 0.152 | True | 1 | 94.9% |
+| `techdoc_0002/ip_address` | 0.179 | True | 1 | 100.0% |
+| `techdoc_0001/serial_number` | 0.205 | True | 1 | 8.4% |
+
+**Post-hoc frontier verification** (`src/verify_prior_strength_frontier.py`,
+new script — splices each converged encoding back into its real Track A
+document, verifies full-document round-trip, then queries the standard
+`frontier_verify_models` trio: `claude_sonnet`, `gpt56_sol`,
+`gemini_31_pro` — deliberately NOT `claude_haiku`, this run's own agent
+backbone, avoiding the same circularity already flagged elsewhere).
+Confirmed: `success=True` in the source file reflects ONLY the local
+4-model ensemble — nothing in the source run ever touches a frontier
+model, same distinction this whole session keeps having to restate.
+
+**Real bugs found, not by review — by the data not matching what was
+intended:**
+
+1. **`find_field_sentence`'s tabular/no-punctuation fallback.** When a
+   document has no nearby sentence-ending period, the function falls
+   back to the entire document as "the sentence." Hit on 2/10 items:
+   `regfiling_0001/company_type` (a fully tabular doc, zero periods
+   anywhere) and `legalrec_0002/statute_reference` (only one period in
+   the whole 288-char document, at the very end).
+2. **`_run_ghost_agent_loop` never validates that a proposed encoding
+   actually covers the FULL target before accepting it.** Faced with
+   the oversized targets bug #1 produced, the agent just encoded the
+   bare field substring. `tool_hamming` correctly returned `-1`
+   (length mismatch) for both — visible directly in the transcript,
+   the agent even second-guessed itself ("The Hamming distance of -1
+   indicates there's an issue..."). But `best_hamming` only updates
+   when a NEW distance exceeds it, so an invalid `-1` silently leaves
+   `best_hamming` at its initial `0`, and the loop still queried the
+   ensemble with the short, context-free fragment and declared
+   `success=True` when it (unsurprisingly) failed to look like a
+   company type / statute reference with no surrounding context.
+   Result: both items show `success=True, hamming=0.0%` in the table
+   above — meaningless, not a real defense result. Confirmed via
+   `Hamming distance: -1` appearing at exactly these 2 spots in the log.
+3. **A quieter version of the same failure, undetected by any current
+   check.** `regfiling_0000/ABN` and `techdoc_0001/serial_number` both
+   show `hamming≈12` against a ~140-char sentence — checking the actual
+   encoding, the agent left the ENTIRE surrounding sentence as exact
+   verbatim plaintext and only permuted the field itself. This passes
+   every current validation (lengths match, since the untouched prefix
+   trivially "renders as itself") but isn't a real sentence-scope
+   obfuscation attempt — it's field-scope with copied context, reported
+   at a deceptively low `hamming_pct` that actually means "almost
+   nothing was touched." This is exactly where the one real frontier
+   extraction happened (`gpt56_sol` on the ABN, see below) — consistent
+   with every field-scope-only result this session.
+4. **A fourth, distinct, not-yet-root-caused failure**, found by
+   `verify_prior_strength_frontier.py`'s own independent round-trip
+   check, not by the source run: `techdoc_0002/ip_address`'s rendered
+   output is the SAME LENGTH as its target (122 vs. 122) but
+   content-mismatched — `tool_hamming`'s length-only check can't catch
+   this since it never compares against the true render, only against
+   length parity. Possibly a bidi/newline interaction in a multi-line
+   tabular document (this doc has 4 `\n`-separated fields) — not
+   investigated further yet.
+5. **`distil_principle`'s output is never validated as an actual usable
+   principle before being persisted.** On 2/10 items, the distillation
+   call itself refused or apologized instead of producing a principle
+   (`"I can't help with this request."` on `ABN`; `"I appreciate the
+   detailed scenario, but I need to be direct: I can't help with
+   this...` on `serial_number`) — and `run_ghost_agent`'s `if
+   principle:` check treats ANY non-empty string as valid, so the
+   refusal text on `serial_number` was silently written into
+   `results/strategy_memory.json` as a real principle (confirmed:
+   principle id `c8e6b203`, `content_type=multi_sentence`, `evidence=1`,
+   its `"principle"` field IS the literal refusal string).
+
+**Compounding effect on `strategy_memory.json`, confirmed by inspecting
+the file directly**: went from 4 → 9 principles this run (baseline
+`n_documents_processed=45` unchanged, since that counter is
+document-level, not touched by this field-level run). Of the 5 new
+entries: 3 are legitimate (real principles about permutation + VS
+injection for multi-sentence numeric content, each correctly tagged
+with a real `prior_strength_ratio`, 0.15-0.18); 1 (id `cddd02e1`,
+`n_chars_range=[258,318]`) is derived from bug #2's bogus "success" on
+`statute_reference` — plausible-sounding text, but never actually
+tested against the real 288-char target; 1 (id `c8e6b203`) is the
+literal refusal string from bug #5. **Worse than an isolated bad
+entry**: `company_type`'s bugged "success" (172 chars, `single_sentence`)
+matched and STRENGTHENED a pre-existing legitimate principle bucket
+(id `011fc4c1`, `n_chars_range=[167,227]`, evidence now 4) via
+`add_principle`'s existing-bucket path — silently inflating a real
+principle's confidence with a false-positive count, not just adding
+new garbage alongside it. **`results/strategy_memory.json` should be
+considered to have a confirmed, real data-integrity problem as of this
+run — not yet cleaned up.**
+
+**Frontier results, restricted to what's actually valid**: 3/10 items
+were correctly skipped by `verify_prior_strength_frontier.py` (bugs #1,
+#2, #4 above — no meaningful encoding to verify). Of the remaining 7,
+17/18 real frontier checks (7 items × up to 3 models, minus gaps)
+defended; the ONE exception was `gpt56_sol` extracting the ABN — one of
+bug #3's field-only-in-sentence-clothing cases, not a genuine
+sentence-scope test. **Among the 5 genuinely valid sentence-scope
+examples** (`jurisdiction_code` ×2, `case_filing_number`,
+`orcid_fragment`, `doi_suffix`), **all 15 frontier checks (5×3)
+defended — zero failures.**
+
+**A genuinely new finding, independent of the bugs above**:
+`regfiling_0003/jurisdiction_code` — the local ensemble gave up
+(`success=False` after 4 iterations, never reaching consensus) — but
+the best encoding it still produced defended against ALL 3 real
+frontier models anyway (`claude_sonnet` refused outright,
+`stop_reason: refusal`). Every prior disagreement this session went
+the OTHER direction (local says defended, frontier extracts — the
+well-documented search/verify gap). This is the first clean
+counterexample showing the local proxy ensemble can be wrong in BOTH
+directions, not just optimistically wrong.
+
+**The prior-strength hypothesis itself: still untested, not
+negatively tested.** Among the 5 genuinely valid examples, defense was
+perfect (15/15) — a ceiling effect leaving zero outcome variance for
+`prior_strength_ratio` (which ranged narrowly, 0.108-0.205, across all
+10 regardless of validity) to explain. This batch cannot answer
+whether prior strength predicts difficulty; it demonstrates instead
+that real sentence-scope obfuscation is extremely effective against
+frontier models when it actually runs correctly — a positive result in
+its own right, independent of the prior-strength question it was
+designed to test.
+
+**Not yet done**: fix all five bugs above (encoding-coverage
+validation in `_run_ghost_agent_loop`, `find_field_sentence`'s tabular
+fallback, the equal-length-content-mismatch render bug, and
+`distil_principle`'s output validation); decide whether/how to clean
+the 2 contaminated `strategy_memory.json` entries (1 new bad entry, 1
+inflated existing entry); a real test of the prior-strength hypothesis
+needs either much larger N or a deliberately harder eval design (e.g.
+the paused frontier-gated train/test split idea, see below) to get
+real outcome variance to correlate against.
+
+## Proposed next-scale experiment: train/test split WITHIN Track A for frontier-gated learning (2026-08-19, paused)
+
+User proposal, discussed but not yet built: generalize the calibration-
+only firewall from "20-doc `calibration.json` = train, all of Track A =
+test" to a 60/40 split OF TRACK A ITSELF — 60% train (frontier-gated
+during search via the existing `frontier_check_fn` mechanism, letting
+`strategy_memory` accumulate principles from real frontier feedback
+across many more real documents/domains than `calibration.json`'s 20
+can offer), 40% test (frontier_check_fn NEVER used during search, only
+queried post-hoc to measure real transferable defense). Confirmed this
+is methodologically sound IN PRINCIPLE — disjointness between train and
+test is what the firewall actually requires, not which specific pool
+the train data comes from.
+
+**Two caveats flagged before building this**, neither disqualifying,
+both real: (1) real cost is far beyond anything run so far — every
+gated attempt costs 2-3 real frontier calls, across many fields/doc, up
+to 5 iterations, over hundreds of train docs — pilot on a small slice
+first; (2) a held-out test split only gives a clean transferability
+claim if what gets learned is genuinely generic strategy, not an
+implicit fingerprint of one frontier model's specific quirks — worth
+checking what real distilled principles look like at this scale before
+trusting a test-split "defended" result as a true transferability
+claim, especially given this session's OWN evidence (immediately above)
+that `distil_principle`'s output can't currently even be trusted to be
+a principle at all, let alone a generic one.
+
+**Paused, not started**: infrastructure doesn't exist yet
+(`convergence.py` has no frontier-gating or train/test-split concept;
+only `calibrate_agent_search.py` supports frontier gating, and only
+against `calibration.json`). Explicitly deferred until the five bugs
+above are fixed — building a bigger, more expensive version of a
+pipeline known to have live data-integrity bugs would just produce more
+contaminated data at greater cost.
+
+## All five real bugs fixed and regression-tested (2026-08-19)
+
+Direct follow-up to the section above — all five bugs found by the real
+10-example sentence-scope run are now fixed, each verified against a
+real repro before/after, plus new regression tests.
+
+**1. `sentence_utils.py`'s tabular/no-punctuation fallback.**
+`_SENTENCE_BOUNDARY_RE` now also splits on any run of newlines,
+independent of preceding punctuation (`r'(?<=[.!?])\s+|\n+'`), not just
+after `[.!?]`. A tabular "Key: Value" line is a natural, human-perceived
+unit on its own, same as a real sentence — treating a newline as a
+boundary too fixes the fallback without needing to special-case tabular
+documents. Confirmed harmless for both existing supported dataset
+shapes (neither `data/raw/documents.json`'s space-joined sentences nor
+the real Track A prose doc `smoke_test_sentence_utils.py` depends on
+contain any newlines at all). **Verified against both real repro
+cases directly**: `regfiling_0001/company_type` now returns `'Company
+Type: PTE LTD'` (21 chars) instead of the whole 172-char document;
+`legalrec_0002/statute_reference` now returns `'Statute Reference: s
+15(3) Civil Procedure Act 2018'` (51 chars) instead of the whole
+288-char document. Existing `smoke_test_sentence_utils.py` (including
+the real multi-field-one-sentence case and the decimal/ICD-code
+non-split edge cases) still passes unchanged.
+
+**2 & 4. `_run_ghost_agent_loop` now validates `rendered ==
+effective_target` before accepting any attempt** — one check fixes
+both bugs, since both are really "the render doesn't match the target":
+the length-mismatch case (agent encodes only the bare field inside an
+oversized/sentence-scope target) and the separate same-length-but-
+content-corrupted case found independently by
+`verify_prior_strength_frontier.py`'s own round-trip check (root cause
+for that specific corruption still not isolated, but this check catches
+it regardless of cause). A failing attempt is rejected and retried —
+no `Attempt` recorded, same treatment `proposed is None` already got,
+bounded by `max_iterations`.
+
+**3. New `min_sentence_scope_hamming_fraction` parameter (default
+`0.3`), enforced only when `field_ground_truth` is given (sentence
+scope).** Rejects an attempt whose Hamming distance is below this
+fraction of the full target's length — catches the quieter bug where
+the agent satisfies check #2 by leaving the ENTIRE surrounding sentence
+as verbatim plaintext and only obfuscating the field itself (passes
+`rendered == target` trivially, since untouched text renders as
+itself). Zero effect on bare-field-scope callers
+(`field_ground_truth=None`, the vast majority of this project's call
+sites) since the check is skipped entirely for them.
+
+**5. New `_is_valid_principle()` helper**, checked before
+`distil_principle`'s output ever reaches `strategy_memory.add_principle`.
+Reuses `adversary.REFUSAL_PHRASES` (the same substring list already
+used to detect a refusal from an ADVERSARY response) plus a minimum-
+length floor (`_MIN_PRINCIPLE_LENGTH = 20`) to reject a plain refusal or
+degenerate short string being persisted as if it were real learned
+strategy — the exact failure mode confirmed in `strategy_memory.json`
+after the source run.
+
+**Secondary finding, NOT fixed (out of scope for today, but real and
+worth knowing before relying on it)**: `backbone.messages.append(...)`
+— the existing per-iteration mechanism that's supposed to tell the
+agent "you cleared the basic threshold but not full consensus, retry
+with a different seed" — is dead code. `backbone.reset()`
+unconditionally wipes `self.messages` at the TOP of every iteration,
+which runs before the agent's next turn but AFTER the previous
+iteration's `messages.append` call — so that feedback has never
+actually reached the agent in any real run to date, including the
+`require_unanimous` margin-warning message documented in the
+"Margin-aware stopping" section above. Any future feedback-to-agent
+mechanism (including telling the agent WHY an attempt was rejected by
+today's new checks) needs to go through `memory`/`Attempt` +
+`format_for_reflection()` instead — the actually-working mechanism —
+not through `backbone.messages`.
+
+**New regression tests, `tests/smoke_test_encoding_validation.py`**
+(no GPU/API): Test 1 reproduces the exact length-mismatch shape (a
+`tool_combine`-encoded bare field inside a longer sentence target) and
+confirms it's rejected + retried, with the eventually-accepted full
+encoding's Hamming distance correctly nonzero (not the old bogus 0).
+Test 2 reproduces the verbatim-prefix-plus-field-only shape and
+confirms rejection under `min_sentence_scope_hamming_fraction` — first
+attempt used a proportionally-short test sentence where the field-only
+encoding accidentally exceeded the 0.3 threshold anyway (a real
+reminder that this is a proxy check, sensitive to field:sentence length
+ratio, not an exact semantic test) — fixed by lengthening the test
+sentence to match the real bug's actual proportions (short field,
+much longer sentence). Test 3 directly unit-tests `_is_valid_principle`
+against real refusal strings from the source run plus a valid-looking
+principle. Full regression sweep (13 smoke test suites, including
+`smoke_test_sentence_utils.py`, `smoke_test_task5.py`,
+`smoke_test_agentic_scope.py`, and all 4 prior-strength suites) — all
+pass.
+
+**Not yet done**: the `strategy_memory.json` cleanup itself (the 2
+contaminated entries from the source run — 1 refusal-string principle,
+1 real principle with an inflated evidence count — still sit in the
+file; these fixes only prevent NEW contamination, they don't retroactively
+clean the existing damage). No re-run of the 10-example batch yet to
+confirm the fixes actually produce 10/10 valid attempts on the same
+real data (would also give a fresh, uncontaminated set of principles
+and a cleaner read on the prior-strength ceiling-effect question).

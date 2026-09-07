@@ -154,6 +154,60 @@ def make_frontier_check_fn(model_key: str, config: dict) -> Callable:
     return _check
 
 
+def make_multi_frontier_check_fn(model_keys: list, config: dict) -> Callable:
+    """
+    Same CALIBRATION-ONLY contract as make_frontier_check_fn, but queries
+    several frontier models and overturns "defended" if ANY of them
+    extracts -- a stricter AND-gate (the encoding must defeat every
+    listed model, not just one) than a single-model check.
+
+    Every model is queried on every attempt that already cleared the
+    local ensemble (same cost-control rule as the single-model gate --
+    run_ensemble_query only calls this at all once local_defended is
+    True). Real per-model results are preserved under "per_model" in the
+    returned dict for later analysis (e.g. is one model in the pair
+    always the one that ends up extracting, or does it vary by field) --
+    do not rely on the top-level "response" string for that, it's a
+    human-readable summary, not structured data.
+
+    Args:
+        model_keys: keys into config["api_models"], e.g.
+            ["gpt56_sol", "claude_sonnet"].
+        config: parsed config.yaml dict.
+
+    Returns:
+        Callable matching run_ensemble_query's frontier_check_fn contract
+        ({"name", "extracted", "refusal", "response"}), plus "per_model".
+    """
+    checks = [
+        (model_key, make_frontier_check_fn(model_key, config))
+        for model_key in model_keys
+    ]
+
+    def _check(encoded_text: str, field_name: str, ground_truth: str) -> dict:
+        per_model = [
+            fn(encoded_text, field_name, ground_truth) for _, fn in checks
+        ]
+        extracted = any(r["extracted"] for r in per_model)
+        # "refusal" here means every failing model failed via refusal
+        # specifically, not garbled-but-wrong -- matches this repo's
+        # convention that refusals are reported separately from FEA, but
+        # for a combined gate that only makes sense if ALL of them
+        # refused rather than just one.
+        refusal = all(r["refusal"] for r in per_model)
+        return {
+            "name": "+".join(model_keys),
+            "extracted": extracted,
+            "refusal": refusal,
+            "response": " | ".join(
+                f"{r['name']}: {r['response']!r}" for r in per_model
+            ),
+            "per_model": per_model,
+        }
+
+    return _check
+
+
 def _call_anthropic(model_id: str, prompt: str, max_tokens: int) -> str:
     import anthropic
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
