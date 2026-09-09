@@ -251,25 +251,50 @@ api_models:
 #                  a held-out calibration sample used to measure the
 #                  search/verify gap. THIS is what gets reported.
 agent_ensemble:
-  consensus_threshold: 3    # of N valid (floor-check-passed) members must
+  consensus_threshold: 2    # of N valid (floor-check-passed) members must
                              # FAIL extraction to declare the encoding
-                             # defended at search time
+                             # defended at search time. TEMPORARILY 2 (was
+                             # 3) to match the 3-of-4 -> 2-of-3 proportional
+                             # supermajority bar after deepseek_llm_7b was
+                             # dropped below -- see that note before
+                             # reverting this back to 3.
   clean_floor_check: true   # query each member on unencoded clean text
                              # first; exclude its vote if it can't even
                              # extract from that (weak instruction-following
                              # != working defense)
-  members:                  # keys into local_models above. Chosen for
-                             # 4 distinct tokenizer families -- deliberately
-                             # excludes qwen25_7b/qwen25_3b since
-                             # deepseek_r1_14b already covers the Qwen
-                             # tokenizer family and qwen25_7b is the
+  members:                  # keys into local_models above. Originally 4,
+                             # chosen for 4 distinct tokenizer families --
+                             # deliberately excludes qwen25_7b/qwen25_3b
+                             # since deepseek_r1_14b already covers the
+                             # Qwen tokenizer family and qwen25_7b is the
                              # encoding-time proxy (would be circular).
+                             #
+                             # TEMPORARY DISK-CONSTRAINED DEVIATION
+                             # (2026-09-09): deepseek_llm_7b dropped for
+                             # the current box's disk budget (~66GB free;
+                             # all 4 members + the qwen25_7b proxy would
+                             # need ~87GB total, unavailable here). Chosen
+                             # to drop because it's the weakest general-
+                             # capability model of the four (DeepSeek's
+                             # original 2023-era 7B chat model -- llama31_8b
+                             # and mistral7b are both stronger instruction-
+                             # followers, deepseek_r1_14b is a larger
+                             # reasoning model) and the LEAST disk saved by
+                             # dropping either of the other two 7-8B members
+                             # would have been the same as this one anyway,
+                             # so pick the weakest of the equally-cheap
+                             # options. This is a real reduction in
+                             # tokenizer-family diversity (3 not 4) --
+                             # revert (restore deepseek_llm_7b, set
+                             # consensus_threshold back to 3) once disk
+                             # allows, before treating any run made under
+                             # this config as representative of the
+                             # originally-designed ensemble.
     - llama31_8b
     - mistral7b
     - deepseek_r1_14b       # reasoning-style member; strip_think_tags
                              # applied unconditionally in adversary.py,
                              # not gated on this flag
-    - deepseek_llm_7b
   frontier_verify_models:   # keys into api_models above
     - claude_sonnet
     - gpt56_sol

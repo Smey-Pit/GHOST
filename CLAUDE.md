@@ -1485,7 +1485,40 @@ systematic. This has not been started yet.
   `temperature` param — so `gpt56_sol` verify-tier results are NOT
   deterministic run-to-run like every other model in this repo. Also note:
   `_call_openai` sends `max_completion_tokens`, not `max_tokens` —
-  `gpt-5.6-sol` rejects the latter too.
+  `gpt-5.6-sol` rejects the latter too. **A second, real exception found
+  2026-09-09**: on a fresh install, `anthropic>=0.34.0` (unpinned upper
+  bound) resolved to `1.4.0`, whose `Messages.create` dropped `temperature`
+  from its signature entirely (confirmed via `inspect.signature`, not a
+  transient error) — every `_call_anthropic` call raised `TypeError`,
+  silently flattened by `query_adversary`'s broad except into `"ERROR"`,
+  which reads as "not extracted" = a false DEFENDED verdict for every
+  Claude frontier-verify call. `_call_anthropic` now tries `temperature=0`
+  first and falls back to omitting it on a `TypeError` mentioning
+  `"temperature"`, same shape as the `gpt56_sol` handling above — so
+  Claude frontier-verify calls are ALSO not guaranteed deterministic
+  run-to-run anymore, depending on which `anthropic` version is installed.
+  Re-check this (`inspect.signature(anthropic.resources.messages.Messages.create)`)
+  after any fresh install before trusting a Claude frontier result.
+- Launching a script via a tool/orchestration layer's own "run in
+  background" mechanism does NOT automatically get a login shell, even if
+  the same command works fine when run interactively or via `bash -lc`
+  directly — confirmed the hard way 2026-09-09: a background launch of
+  `python3 src/verify_prior_strength_learning.py` (missing a `bash -lc`
+  wrapper) ran with no `HF_HOME` and no API keys set. Missing API keys
+  would have failed loudly later, but the missing `HF_HOME` failed
+  silently and expensively instead: `huggingface_hub` fell back to its
+  default `~/.cache/huggingface` (instead of this project's real cache at
+  `$HF_HOME`), didn't recognize the Qwen proxy as already cached there,
+  and started re-downloading all ~15GB of it into the wrong location —
+  filling the disk completely (100GB/100GB, 3.8MB free) and crashing with
+  an unrelated-looking `xet_get`/`RuntimeError: Internal Writer Error:
+  Background writer channel closed` (a disk-full symptom, not a real xet
+  bug). Always wrap a background-launched command in `bash -lc '...'`
+  when it depends on anything set in `~/.bashrc`/`~/.bash_profile`
+  (`HF_HOME`, every API key) — this is the same lesson as the
+  `GOOGLE_API_KEY` bullet above, just confirmed to also bite
+  orchestration-layer background launches, not only naive `python3 -c`
+  one-liners.
 
 ## Track A dataset generation (`plans/TRACK_A_SPEC.md`) — GENERATION COMPLETE, flags triaged (2026-08-16)
 
@@ -1617,6 +1650,14 @@ point whether to bundle the release with the encoded GHOST conditions
 (`src/encode.py` output) rather than shipping raw/clean documents alone,
 since the paper's actual experiments run on the encoded versions, not
 the raw generation.
+
+**Update (2026-09-09):** the `documents.jsonl`/`fields.jsonl`/
+`generation_log.jsonl` triple (the post-triage, patched version described
+above) is now uploaded to `SmithPit/GHOST_dataset` on HuggingFace — but as
+a **private** dataset repo, used only to move data onto a fresh compute
+box (see "Environment migration" below), not a public release. Both open
+decisions immediately above are still unresolved; nothing about this
+upload should be read as them having been settled.
 
 ## Seed fix for `bidi_permute`/`combine_permute`, and `convergence.py` proxy wiring (2026-08-17)
 
@@ -2491,3 +2532,204 @@ clean the existing damage). No re-run of the 10-example batch yet to
 confirm the fixes actually produce 10/10 valid attempts on the same
 real data (would also give a fresh, uncontaminated set of principles
 and a cleaner read on the prior-strength ceiling-effect question).
+
+## Environment migration to a fresh rented GPU box, and the sentence-scope prior-strength re-run (2026-09-09)
+
+Picked the GHOST-Agent thread back up in a **new, empty environment** —
+this box is a rented GPU instance (`/root/setup_ghost_gpu.sh`'s
+frp.gpu.ai-style bootstrap), not the Spartan HPC every session above ran
+on. `git clone` brought the code, but `data/raw/`, `data/track_a/`,
+`results/`, and `venv/` are all `.gitignore`d and none of them existed on
+disk — every real artifact described in this file up to this point
+(Track A's 1000 docs, `strategy_memory.json`, every `verify_*.json`
+result) lived only on the old machine. GPU (A100 80GB) and a single
+100GB disk are present; nothing else was pre-populated.
+
+**Track A recovery via HuggingFace.** The user had separately uploaded
+the triaged `data/track_a/full/` triple to a **private** HF dataset repo,
+`SmithPit/GHOST_dataset` (see the "Update (2026-09-09)" note on the Track
+A section above — this is a data-mobility upload, not the public release
+those two open decisions are still gating). Required an `HF_TOKEN`
+(fine-grained, `canReadGatedRepos: true`) added to `~/.bashrc`/
+`~/.bash_profile` — confirmed this same token also already has accepted
+access to the gated `meta-llama/Llama-3.1-8B-Instruct` repo, so no
+separate gated-model blocker this time. Downloaded and verified all 1000
+docs / 3302 field records match the prior session's triage state, and
+specifically confirmed all 10 fields the original (pre-bug-fix) 10-example
+run used are present with matching ground truths.
+
+**Real bug found and fixed, `src/sentence_utils.py`'s `find_field_sentence`
+— a THIRD real bug in this function, distinct from the five fixed in the
+section above.** The function trusted a caller-supplied `char_span`
+blindly, with no check that `text[start:end]` actually equals
+`field_value`. For `regfiling_0003/jurisdiction_code`
+(`char_span_status: "unresolved"` — a genuine paraphrase, ground truth
+`"QLD-10"` never appears verbatim, the text only says "Queensland"), the
+stale offsets pointed at unrelated text (`"siness"`, inside "business" in
+an unrelated sentence about "the Australian Business Registry..."), and
+the function confidently returned that WRONG sentence instead of
+signalling "not locatable." Caught during a deliberate dry-run check
+before spending real GPU/API budget, not by a test suite — this exact
+class of silent-wrong-answer is why the dry run was worth doing. Fixed:
+a `char_span` is now verified against `field_value` before being trusted;
+on mismatch, falls through to `text.find`, then to `None`, exactly like
+the no-`char_span` path already did. Verified against the real repro
+(now correctly returns `None`) and against all other 9 original
+candidates (still correctly located, unaffected) — regression-tested via
+`smoke_test_sentence_utils.py`'s `data/raw/documents.json` case (had to
+regenerate that fixture via `src/dataset.py`, deterministic/no-GPU, since
+it doesn't exist on this fresh box either) plus a manual equivalent of
+the `pilot/`-fixture check against `data/track_a/full/regfiling_0000`
+(the `pilot/` subset itself was never uploaded to the HF repo, only
+`full/` — not a code issue, just a missing local fixture).
+
+**Real bug found and fixed, `anthropic` SDK version drift** — see the new
+Gotchas bullet above for the full mechanism (`Messages.create` losing
+`temperature` in the installed 1.4.0). Found by directly inspecting the
+installed SDK's signature during the dry run, not by a failing call in
+context — worth calling out because this would have silently corrupted
+every future frontier-verify call against Claude models (a `TypeError`
+reading as a false DEFENDED verdict) with no visible symptom in a normal
+run's output. `openai` (3.10.0) and `google-genai` (2.22.0) were checked
+the same way and are clean — confirmed via real API calls to
+`gpt-5.5`/`gemini-3.1-pro-preview`/`claude-haiku-4-5`, all returned
+correctly.
+
+**Disk-constrained ensemble deviation.** All 4 `agent_ensemble.members` +
+the `qwen25_7b` proxy need ~87GB cached simultaneously (the ensemble
+reload-every-iteration design means all weights must stay resident on
+disk across a field's iterations, not just the currently-loaded one) —
+this box only had 66GB free at the time, and the 1.2TB filesystem visible
+via `mount` turned out to be the HOST's disk bind-mounted only into
+specific container files (`/etc/hosts`, `/etc/hostname`,
+`/etc/resolv.conf`), not usable general storage. User's call: drop
+`deepseek_llm_7b` (DeepSeek's original 2023-era 7B chat model — the
+weakest general-capability member of the four; `llama31_8b`/`mistral7b`
+are both stronger instruction-followers and `deepseek_r1_14b` is a larger
+reasoning model) and adjust `agent_ensemble.consensus_threshold` 3→2 to
+preserve the same proportional supermajority (3-of-4 ≈ 2-of-3) rather
+than silently becoming full-unanimity. Documented in `config.yaml` itself
+as a **temporary, reversible, disk-constrained deviation** — restore
+`deepseek_llm_7b` and `consensus_threshold: 3` once disk allows, before
+treating a run under this config as representative of the originally-
+designed 4-member ensemble. All 3 remaining members plus the proxy were
+each confirmed loading onto real GPU (`cuda:0`, not the documented silent-
+CPU-fallback trap) via their actual production loaders before committing
+to a real run: `mistral7b` 14.5GB/147s, `llama31_8b` 16.06GB/145s (gated,
+confirmed working), `deepseek_r1_14b` 29.55GB/256s, `qwen25_7b` proxy
+15.28GB/155s (via `encode.load_proxy_model`, not just the generic
+ensemble loader). Final disk: 92GB/100GB used, 8.5GB free — tight but
+sufficient once nothing more needs downloading.
+
+**The first real launch attempt crashed from the background-launch
+environment-sourcing gap** now documented in the new Gotchas bullet above
+— missing `HF_HOME` triggered a full duplicate re-download of the
+already-cached Qwen proxy into the wrong (`~/.cache/huggingface`)
+location, filling the disk to 100GB/100GB (3.8MB free) and crashing with
+a disk-full-shaped `xet_get` error. Fixed by deleting the stray duplicate
+(scoped narrowly to `~/.cache/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct`
+specifically — a broader `rm -rf ~/.cache/huggingface` was correctly
+blocked by the harness's own destructive-action classifier) and
+relaunching with `bash -lc` wrapping so `HF_HOME` and every API key were
+actually present.
+
+**The real 10-example sentence-scope run itself (`src/
+verify_prior_strength_learning.py`, one candidate swapped:
+`regfiling_0003/jurisdiction_code` → `regfiling_0002/jurisdiction_code`,
+since the former is now correctly `None` per the bug fix above and the
+original script had no `None`-handling — replacement preserves the
+original "same field type, different doc" comparison intent).** Completed
+in 25m36s, 9/10 succeeded (all in exactly 1 iteration). Full results:
+`results/raw/verify_prior_strength_learning.json`.
+
+- **Bug-validation objective: fully achieved, on real (not synthetic)
+  data.** All three of today's relevant fixes from the section above
+  fired for real: the encoding-coverage validation correctly rejected an
+  under-scoped iteration-1 attempt on `acadid_0001/doi_suffix` (agent
+  encoded only the bare 15-char field inside the 98-char target
+  sentence); `strategy_memory.json` came out with 3 clean principles and
+  zero contamination (vs. the source run's 2 contaminated entries);
+  `_is_valid_principle` caught and discarded one genuine Claude Haiku
+  refusal during distillation (`"I appreciate the creative prompt, but I
+  need to be direct: I can't provide this..."`, on the otherwise-
+  successful `techdoc_0002/ip_address`) instead of it being silently
+  written to memory like the analogous refusal was in the source run.
+- **A new, real instance of the already-documented "dead reflection
+  channel" bug.** `acadid_0001/doi_suffix`'s failure is the one place
+  the coverage-validation fix actually rejected something in this run —
+  and once it did, the agent had no memory of *why* (per the section
+  above, `backbone.messages` never actually reaches the agent, wiped by
+  `reset()` before its next turn) and spent iterations 2-5 progressively
+  more confused, each one insisting "no attempts yet" (once literally
+  while being told it was iteration 5) rather than adjusting strategy.
+  This is the first time this specific consequence has been observed
+  end-to-end on real data, not just diagnosed from reading the code.
+- **The prior-strength hypothesis: still unresolved, cleanly this time —
+  and the 1-iteration ceiling has a specific, not-hypothetical cause.**
+  The ceiling effect from the source run recurred even with all bugs
+  fixed — 9/9 valid attempts converged in exactly 1 iteration, and
+  Hamming% only spans 92.0-100.0% (a ~8-point band). Checked the
+  correlation anyway: `prior_strength_ratio` vs. `hamming_pct` gives
+  Pearson r ≈ 0.07 across the 9 valid points — no signal, but expected
+  and not a meaningful negative result given how narrow the range is.
+  **This is not evidence that sentence-scope obfuscation is robustly
+  effective — it is the already-documented weak-search-tier problem
+  (see "Agentic-ness critique and fixes" above: the search tier is
+  "deliberately the WEAK proxy," chosen for tokenizer diversity, not
+  strength) recurring, and today's disk-constrained drop to 3 members
+  (`consensus_threshold: 2`, i.e. only 2 of 3 need to fail) makes the bar
+  the agent has to clear even weaker than the original 4-member design
+  already was.** Every one of today's 9 successes is a local-ensemble
+  verdict only — this run never ran a post-hoc frontier check, so
+  whether these specific 9 "defended" encodings would survive a real
+  `gpt56_sol`/`gemini_31_pro` query is completely unmeasured, not just
+  optimistic. Given this exact model (`gpt56_sol`) has now extracted
+  correctly through local-"defended" encodings repeatedly elsewhere in
+  this project (the search/verify gap sections above, and the static
+  bidi-only max-Hamming check), the honest prior is that a real fraction
+  of these 9 would NOT hold up against frontier models — this run's
+  9/10 number should not be quoted as a defense success rate without
+  that caveat attached.
+- **Claude Haiku's distillation refusal is a recurring friction point,
+  not a one-off, and needs addressing beyond "discard it."**
+  `_is_valid_principle` correctly stops a refusal from being written into
+  `strategy_memory.json` as if it were real strategy (see above) — but
+  that only prevents contamination, it doesn't recover the lost learning
+  signal on a field the agent otherwise defeated. The refused case
+  (`techdoc_0002/ip_address`) was a genuine search SUCCESS; the
+  distillation call afterward hit Haiku's own safety guardrails around
+  describing "how to evade detection" in the abstract, even though the
+  same model executed the actual tool calls that produced the encoding
+  without any objection. Left as-is, an unknown fraction of successful
+  fields will silently lose their principle-distillation step every run
+  purely because of how `distil_principle`'s prompt is framed, not
+  because of anything about the encoding itself — this directly limits
+  how much `strategy_memory` can actually accumulate over a larger batch.
+  Worth addressing (e.g. reframing the distillation prompt away from
+  language that reads as "how to evade detection/safety systems," or
+  routing distillation through a different backbone than the one doing
+  the search) rather than treating the current discard-and-move-on
+  behavior as the finished fix.
+
+**Not yet done**: still N=1 real run at this scale — the ceiling effect
+means a larger N (more fields, or fields deliberately chosen to be
+harder for the local ensemble, mirroring how the calibration-gate
+sections above got real iteration variance) is what's actually needed to
+get outcome variance to test prior-strength against, not just more of
+the same easy fields. Given the weak-ensemble diagnosis immediately
+above, a real N-scaling attempt should also either restore the full
+4-member ensemble (once disk allows) or add a post-hoc frontier check
+(mirroring `verify_prior_strength_frontier.py`'s pattern from the source
+run) — otherwise a larger N just produces a larger number of
+locally-"defended" verdicts of unknown real validity, not a stronger
+result. The `strategy_memory.json` cleanup from the source run's 2
+contaminated entries is still outstanding (this run's clean 3 principles
+are net-new, alongside the old contaminated ones, not a replacement for
+them). The dead-reflection-channel fix itself (routing rejection
+feedback through `format_for_reflection()` instead of the inert
+`backbone.messages`) is still unimplemented — today just confirmed its
+real-world cost on one field. The Claude Haiku distillation-refusal
+friction point above is also unaddressed. `config.yaml`'s disk-constrained
+3-member ensemble deviation should be reverted to the original 4-member
+design once this box's disk is resized, before any future run under this
+config is treated as representative.

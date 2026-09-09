@@ -85,9 +85,22 @@ def find_field_sentence(text, field_value, char_span=None):
         field/span cannot be located in text at all (e.g. field_value is
         empty, or genuinely absent from text).
     """
+    f_start = f_end = None
     if char_span is not None:
-        f_start, f_end = char_span
-    else:
+        cs_start, cs_end = char_span
+        # A caller-supplied char_span is only trustworthy if it actually
+        # points at field_value -- real bug found 2026-09-09: Track A's own
+        # generation-time validation already flags some fields
+        # char_span_status="unresolved" (the value is a genuine paraphrase,
+        # e.g. ground truth "QLD-10" but the text only says "Queensland"),
+        # and for those the stored offsets are stale and point at unrelated
+        # text. Blindly trusting them here silently returned the WRONG
+        # sentence (one that doesn't even contain field_value) instead of
+        # signalling "not locatable." Verify before trusting; fall through
+        # to text.find, then to None, exactly like the no-char_span path.
+        if text[cs_start:cs_end] == field_value:
+            f_start, f_end = cs_start, cs_end
+    if f_start is None:
         if not field_value:
             return None
         f_start = text.find(field_value)

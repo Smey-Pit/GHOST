@@ -211,12 +211,34 @@ def make_multi_frontier_check_fn(model_keys: list, config: dict) -> Callable:
 def _call_anthropic(model_id: str, prompt: str, max_tokens: int) -> str:
     import anthropic
     client = anthropic.Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
-    response = client.messages.create(
-        model=model_id,
-        max_tokens=max_tokens,
-        temperature=0,
-        messages=[{"role": "user", "content": prompt}],
-    )
+    try:
+        response = client.messages.create(
+            model=model_id,
+            max_tokens=max_tokens,
+            temperature=0,
+            messages=[{"role": "user", "content": prompt}],
+        )
+    except TypeError as e:
+        # Real bug found 2026-09-09: the anthropic SDK version resolved by
+        # this environment's unpinned `anthropic>=0.34.0` (1.4.0) dropped
+        # `temperature` from Messages.create entirely -- confirmed via
+        # inspect.signature, not a transient API error. Without this
+        # fallback, every real call raised TypeError, which
+        # query_adversary's broad except flattened into "ERROR" --
+        # indistinguishable from a real failure and silently read as
+        # "not extracted" = a false DEFENDED verdict for every Claude
+        # frontier-verify call. Same failure SHAPE as gpt56_sol rejecting
+        # temperature=0 (CLAUDE.md's "Temperature=0 for every model call"
+        # gotcha) -- determinism is not guaranteed for this call site
+        # anymore, not a bug to silently paper over without flagging it.
+        if "temperature" in str(e):
+            response = client.messages.create(
+                model=model_id,
+                max_tokens=max_tokens,
+                messages=[{"role": "user", "content": prompt}],
+            )
+        else:
+            raise
     # stop_reason == "refusal" -> content is [] (a distinct Anthropic API
     # signal, separate from a normal empty/short response). Blindly
     # indexing content[0] here threw IndexError, which query_adversary's

@@ -50,7 +50,21 @@ CANDIDATES = [
     ("regfiling_0000", "jurisdiction_code"),   # short opaque code
     ("regfiling_0000", "ABN"),                 # sentence carries a real company name
     ("regfiling_0001", "company_type"),        # very short, generic ("PTE LTD")
-    ("regfiling_0003", "jurisdiction_code"),   # same field type, different doc
+    ("regfiling_0002", "jurisdiction_code"),   # same field type, different doc
+                                                # (swapped from regfiling_0003
+                                                # 2026-09-09: that field's
+                                                # char_span_status is
+                                                # "unresolved" -- a genuine
+                                                # paraphrase, ground truth
+                                                # "QLD-10" never appears
+                                                # verbatim in the text -- so
+                                                # find_field_sentence now
+                                                # correctly returns None for
+                                                # it post-fix, instead of the
+                                                # wrong sentence it silently
+                                                # returned before. Not
+                                                # locatable, so not a valid
+                                                # candidate for this script.
     ("legalrec_0000", "case_filing_number"),   # legal boilerplate sentence
     ("legalrec_0002", "statute_reference"),    # longest field, formulaic legal phrasing
     ("acadid_0000", "orcid_fragment"),         # sentence names a real person
